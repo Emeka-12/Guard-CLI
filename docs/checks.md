@@ -512,6 +512,25 @@ Panics abort the transaction with an unhelpful, generic error and can leave the 
 
 ---
 
+## `unchecked-token-amount` (Medium)
+
+**What it detects**
+
+Token transfer or mint-style calls (such as `transfer`, `transfer_from`, `xfer`, or `mint`) where the amount argument is used without a visible guard that validates it is greater than zero.
+
+**Why it matters**
+
+Zero or otherwise invalid token amounts can lead to no-op or unintended balance changes and may bypass the intended safety checks around token accounting.
+
+**Limitations**
+
+- Detection is heuristic and based on the method name and simple guard patterns.
+- It does not prove the amount is validated in every path or through helper functions.
+
+**Fixture:** tests in `crates/checks/src/unchecked_token_amount.rs`
+
+---
+
 ## `large-loop` (Medium)
 
 **What it detects**
