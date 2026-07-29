@@ -152,7 +152,7 @@ Soroban contracts compile to WASM with `#![no_std]`. Importing from `std` causes
 
 **What it detects**
 
-A string literal anywhere in the file that matches the shape of a Stellar `StrKey` public key — a 56-character base32 run starting with `G`, bounded by non-alphanumeric characters on both sides. Works on the raw source text rather than the parsed AST, so it catches keys regardless of which expression they appear in.
+A string literal anywhere in the file that matches the shape of a Stellar `StrKey` address — a 56-character base32 run starting with `G` (Ed25519 public key) or `C` (Soroban contract address), bounded by non-alphanumeric characters on both sides. Works on the raw source text rather than the parsed AST, so it catches addresses regardless of which expression they appear in.
 
 **Why it matters**
 
@@ -160,7 +160,7 @@ Baking a fixed account or contract address into source code breaks the contract 
 
 **Limitations**
 
-- Purely textual pattern matching — it does not verify the candidate is a valid `StrKey` checksum, so it can flag any 56-char `G...` run, including ones in comments or non-address strings that happen to match the shape.
+- Purely textual pattern matching — it does not verify the candidate is a valid `StrKey` checksum, so it can flag any 56-char `G...` or `C...` run, including ones in comments or non-address strings that happen to match the shape.
 - Does not track whether the literal is actually used to construct an `Address` (e.g. via `Address::from_str`) vs. just printed or compared.
 
 **Fixture:** `test-contracts/hardcoded-address-vulnerable/`, `test-contracts/hardcoded-address-safe/`
