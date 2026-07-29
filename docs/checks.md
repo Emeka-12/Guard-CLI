@@ -512,6 +512,25 @@ Panics abort the transaction with an unhelpful, generic error and can leave the 
 
 ---
 
+## `missing-event-for-admin-change` (Medium)
+
+**What it detects**
+
+Public admin-mutating functions such as `set_owner`, `set_admin`, `transfer_ownership`, or `set_operator` that mutate storage but do not emit an event.
+
+**Why it matters**
+
+Administrative changes should be observable off-chain for auditing and monitoring. Missing events make governance actions harder to track and can leave clients with stale state.
+
+**Limitations**
+
+- Detection is name-based and heuristic rather than semantic.
+- It only looks for simple storage writes and `publish` calls in the same method body.
+
+**Fixture:** tests in `crates/checks/src/missing_event_for_admin_change.rs`
+
+---
+
 ## `large-loop` (Medium)
 
 **What it detects**
