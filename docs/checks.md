@@ -432,6 +432,28 @@ Attempting a transfer without verifying the sender has sufficient funds can caus
 
 ---
 
+## `unprotected-token-mint` (High)
+
+**Status:** Phase 3
+
+**What it detects**
+
+Public (`pub fn`) methods in `#[contractimpl]` whose name contains `mint`, `burn`, `issue`, `redeem`, or `create_tokens`, and whose body contains **no** call to `require_auth` or `require_auth_for_args` on any receiver.
+
+**Why it matters**
+
+Token supply operations are among the most sensitive entrypoints in a Soroban contract. Without an auth gate, any account on the Stellar network can call `mint` or `burn` directly, inflating or destroying token balances at will. This is an immediate economic exploit — comparable to a printable-money bug — and is essentially irreversible once the transaction hits the ledger.
+
+**Limitations**
+
+- Name-based heuristic only: functions that perform minting logic under a different name (e.g. `distribute`, `award`) are not detected.
+- Any `require_auth` / `require_auth_for_args` call anywhere in the method body clears the finding, even if it is inside a branch that is never reached in practice.
+- Does not verify that the caller being authenticated is actually a trusted admin; a contract that calls `require_auth()` on the wrong address still passes this check.
+
+**Fixture:** `test-contracts/token-mint-vulnerable/`, `test-contracts/token-mint-safe/`
+
+---
+
 ## `unbounded-vec-growth` (Medium)
 
 **What it detects**
