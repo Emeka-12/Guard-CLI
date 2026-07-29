@@ -102,6 +102,11 @@ fn zero_address_fixtures() {
     assert_fixture_pair("zero-address", "missing-zero-address-check");
 }
 
+#[test]
+fn uninitialized_storage_read_fixtures() {
+    assert_fixture_pair("uninitialized-storage-read", "uninitialized-storage-read");
+}
+
 /// Verify that `soroban-guard.toml` is read and its `[checks.sensitive_names].extra` list
 /// extends the built-in admin check so that custom function names are flagged.
 #[test]
