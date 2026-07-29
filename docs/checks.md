@@ -512,22 +512,22 @@ Panics abort the transaction with an unhelpful, generic error and can leave the 
 
 ---
 
-## `unchecked-token-amount` (Medium)
+## `missing-ttl-extension` (Low)
 
 **What it detects**
 
-Token transfer or mint-style calls (such as `transfer`, `transfer_from`, `xfer`, or `mint`) where the amount argument is used without a visible guard that validates it is greater than zero.
+In `#[contractimpl]` methods, writes to persistent storage (`env.storage().persistent().set(...)`, `remove(...)`, or `append(...)`) that are not followed by an `env.storage().persistent().extend_ttl(...)` call in the same function.
 
 **Why it matters**
 
-Zero or otherwise invalid token amounts can lead to no-op or unintended balance changes and may bypass the intended safety checks around token accounting.
+Persistent contract storage entries eventually expire. Without an explicit TTL extension, the ledger can archive the data and later reads may fail or behave unexpectedly.
 
 **Limitations**
 
-- Detection is heuristic and based on the method name and simple guard patterns.
-- It does not prove the amount is validated in every path or through helper functions.
+- Only checks for direct persistent writes and TTL extension calls in the same function body.
+- Does not analyze helper functions or control-flow paths that extend TTL elsewhere.
 
-**Fixture:** tests in `crates/checks/src/unchecked_token_amount.rs`
+**Fixture:** `test-contracts/ttl-vulnerable/`, `test-contracts/ttl-safe/`
 
 ---
 
