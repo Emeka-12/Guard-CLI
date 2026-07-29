@@ -132,15 +132,21 @@ fn run_scan(
                 }
             } else if opts.sarif {
                 if !opts.quiet || should_fail {
-                    let payload =
-                        serde_json::to_string_pretty(&build_sarif(&findings)).unwrap();
-                    if let Some(ref out_path) = opts.output {
-                        if let Err(e) = write_output(out_path, &payload) {
+                    match serde_json::to_string_pretty(&build_sarif(&findings)) {
+                        Ok(payload) => {
+                            if let Some(ref out_path) = opts.output {
+                                if let Err(e) = write_output(out_path, &payload) {
+                                    eprintln!("{} {}", "error:".red().bold(), e);
+                                    return 2;
+                                }
+                            } else {
+                                println!("{payload}");
+                            }
+                        }
+                        Err(e) => {
                             eprintln!("{} {}", "error:".red().bold(), e);
                             return 2;
                         }
-                    } else {
-                        println!("{payload}");
                     }
                 }
             } else if opts.markdown {
@@ -172,7 +178,10 @@ fn run_scan(
         Err(e) => {
             if opts.json {
                 let envelope = serde_json::json!({ "error": e.to_string() });
-                println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+                match serde_json::to_string_pretty(&envelope) {
+                    Ok(payload) => println!("{}", payload),
+                    Err(json_err) => eprintln!("{} {}", "error:".red().bold(), json_err),
+                }
             } else {
                 eprintln!("{} {}", "error:".red().bold(), e);
             }
@@ -670,11 +679,11 @@ fn describe_check(name: &str) -> (&'static str, &'static str) {
         "unchecked-arithmetic" => ("medium", "Flags unchecked arithmetic on contract state"),
         "unprotected-admin" => ("high", "Flags privileged entrypoints without auth"),
         "unsafe-storage-patterns" => ("medium", "Flags temporary storage and dynamic Symbol keys"),
-        "missing-ttl-extension" => ("medium", "Flags persistent storage entries without TTL extension"),
+        "missing-ttl-extension" => ("low", "Flags persistent storage entries without TTL extension"),
         "forbidden-std-imports" => ("high", "Flags use of std in no_std Soroban contracts"),
         "hardcoded-address" => ("medium", "Flags hardcoded Stellar address literals"),
         "unsafe-cross-contract-input" => ("high", "Flags unvalidated return values from cross-contract calls"),
-        "missing-contract-annotation" => ("medium", "Flags structs missing the #[contract] attribute"),
+        "missing-contract-annotation" => ("low", "Flags structs missing the #[contract] attribute"),
         "delegate-call-risk" => ("high", "Flags delegate-call patterns that transfer execution control"),
         "integer-division-truncation" => ("medium", "Flags integer division that silently truncates"),
         "missing-event-emission" => ("medium", "Flags state-mutating functions with no event emission"),
