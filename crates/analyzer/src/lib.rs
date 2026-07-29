@@ -52,6 +52,8 @@ pub enum ScanError {
         path: PathBuf,
         message: String,
     },
+    #[error("Invalid glob pattern `{pattern}`: {reason}")]
+    InvalidGlobPattern { pattern: String, reason: String },
 }
 
 #[derive(Default)]
@@ -179,14 +181,27 @@ fn collect_rust_paths(
     excludes: &[String],
     includes: &[String],
 ) -> Result<(Vec<PathBuf>, usize), ScanError> {
-    let exclude_patterns: Vec<glob::Pattern> = excludes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-    let include_patterns: Vec<glob::Pattern> = includes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
+    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
+    for p in excludes {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => exclude_patterns.push(pattern),
+            Err(e) => return Err(ScanError::InvalidGlobPattern {
+                pattern: p.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+
+    let mut include_patterns: Vec<glob::Pattern> = Vec::new();
+    for p in includes {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => include_patterns.push(pattern),
+            Err(e) => return Err(ScanError::InvalidGlobPattern {
+                pattern: p.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
 
     if root.is_file() {
         return Ok((vec![root.to_path_buf()], 0));
@@ -394,10 +409,16 @@ pub fn scan_files(
     excludes: &[String],
 ) -> Result<(Vec<Finding>, usize), ScanError> {
     let root = root.canonicalize()?;
-    let exclude_patterns: Vec<glob::Pattern> = excludes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
+    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
+    for p in excludes {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => exclude_patterns.push(pattern),
+            Err(e) => return Err(ScanError::InvalidGlobPattern {
+                pattern: p.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
 
     let filtered: Vec<&PathBuf> = paths
         .iter()
@@ -561,6 +582,48 @@ mod tests {
         let (_, files_scanned) =
             scan_files(&[excluded], &root, &["src/other.rs".to_string()]).unwrap();
         assert_eq!(files_scanned, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_directory_rejects_invalid_exclude_glob() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-invalid-glob-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let result = scan_directory(&root, &["src/[foo.rs".to_string()], &[]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid glob pattern") || err_msg.contains("src/[foo.rs"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_directory_rejects_invalid_include_glob() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-invalid-include-glob-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let result = scan_directory(&root, &[], &["src/[invalid.rs".to_string()]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid glob pattern") || err_msg.contains("src/[invalid.rs"));
 
         fs::remove_dir_all(root).unwrap();
     }
