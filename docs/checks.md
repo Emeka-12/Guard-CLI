@@ -618,3 +618,22 @@ Upgrade and migration entrypoints replace the contract's executable code. Withou
 - Any `require_auth` / `require_auth_for_args` call anywhere in the body clears the finding (no dataflow).
 
 **Fixture:** `test-contracts/upgrade-vulnerable/`, `test-contracts/upgrade-safe/`
+
+---
+
+## `unprotected-contract-deployment` (High)
+
+**What it detects**
+
+In a `#[contractimpl]` method, a call to `.deployer()` (e.g. `env.deployer().upload_contract_wasm(...)` or `env.deployer().deploy(...)`) with no call to `require_auth` or `require_auth_for_args` anywhere in the same method body.
+
+**Why it matters**
+
+Deploying or uploading contract WASM is a privileged operation. Without an authorization check, any caller could deploy arbitrary contracts through the flagged entrypoint, including on behalf of the contract itself.
+
+**Limitations**
+
+- Only detects `.deployer()` calls made directly in the method body; deployment logic delegated to a helper function is not visible to this check.
+- Any `require_auth` / `require_auth_for_args` call anywhere in the body clears the finding (no dataflow), even if it does not actually gate the deployer call.
+
+**Fixture:** `test-contracts/contract-deployment-vulnerable/`, `test-contracts/contract-deployment-safe/`
