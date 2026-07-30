@@ -27,9 +27,10 @@ set -euo pipefail
 echo "→ Running Soroban Guard scan…"
 
 # Scan the repository root; adjust the path if your contract lives elsewhere.
-soroban-guard scan .
-
-STATUS=$?
+# `|| STATUS=$?` keeps set -e from aborting on a non-zero exit, so the
+# branches below are actually reachable.
+STATUS=0
+soroban-guard scan . || STATUS=$?
 
 if [ $STATUS -eq 1 ]; then
   echo ""
