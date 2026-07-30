@@ -23,63 +23,14 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Scan a directory tree for vulnerability patterns
-    Scan {
-        /// Path to the contract crate or folder containing Rust sources
-        path: PathBuf,
-        /// Print findings as JSON (`{ "summary": {...}, "findings": [...] }`)
-        #[arg(long)]
-        json: bool,
-        /// Print findings as a SARIF 2.1.0 document
-        #[arg(long)]
-        sarif: bool,
-        /// Print findings as a Markdown table
-        #[arg(long)]
-        markdown: bool,
-        /// Write output to a file instead of stdout (applies to --json and --sarif)
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Suppress all output when there are zero High findings
-        #[arg(long)]
-        quiet: bool,
-        /// Disable colored output
-        #[arg(long)]
-        no_color: bool,
-        /// Print additional scan statistics such as skipped generated files
-        #[arg(long)]
-        verbose: bool,
-        /// Only scan files matching this glob pattern (e.g. `src/token*.rs`); may be repeated
-        #[arg(long, value_name = "PATTERN")]
-        include: Vec<String>,
-        /// Exclude files matching this glob pattern (e.g. `src/proxy.rs`); may be repeated
-        #[arg(long, value_name = "PATTERN")]
-        exclude: Vec<String>,
-        /// Exit code 1 when findings at or above this severity are found (high|medium|low, default: high)
-        #[arg(long, default_value = "high")]
-        fail_on: String,
-        /// Disable a named check (may be repeated)
-        #[arg(long, value_name = "CHECK")]
-        disable_check: Vec<String>,
-        /// Watch for .rs file changes and re-run the scan automatically
-        #[arg(long, short = 'w')]
-        watch: bool,
-    },
-    /// List the checks that are enabled by default
-    ListChecks,
-    /// Print full documentation for a named check
-    Explain {
-        /// Name of the check (e.g. `missing-require-auth`)
-        check_name: String,
-    },
-    /// Print shell completion scripts for Bash, Zsh, Fish, or PowerShell
-    Completions {
-        /// Shell to generate completions for
-        shell: Shell,
-    },
-    /// Print version and build information
-    Version,
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
+    }
 }
 
 /// Parameters passed to the core scan-and-print routine.
@@ -435,6 +386,41 @@ fn main() {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             println!("target: {}-{}", std::env::consts::ARCH, std::env::consts::OS);
         }
+    }
+}
+
+
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
+    }
+}
+
+
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
+    }
+}
+
+
+
+
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
     }
 }
 
