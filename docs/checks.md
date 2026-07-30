@@ -659,3 +659,43 @@ Deploying or uploading contract WASM is a privileged operation. Without an autho
 - Any `require_auth` / `require_auth_for_args` call anywhere in the body clears the finding (no dataflow), even if it does not actually gate the deployer call.
 
 **Fixture:** `test-contracts/contract-deployment-vulnerable/`, `test-contracts/contract-deployment-safe/`
+
+---
+
+## `missing-event-for-admin-change` (Medium)
+
+**What it detects**
+
+Public admin-mutating functions inside `#[contractimpl]` whose name matches a sensitive set (`set_owner`, `set_admin`, `transfer_ownership`, `set_operator`) that write to storage via `set`, `remove`, or `append` but contain no call to `env.events().publish()`.
+
+**Why it matters**
+
+Administrative changes — transferring ownership, rotating operators, changing administrators — are among the most security-critical state transitions in a contract. Without an emitted event, off-chain monitors, indexers, and governance tools have no reliable way to observe or audit these transitions. Silent privilege escalation is difficult to detect after the fact.
+
+**Limitations**
+
+- Detection is name-based; admin functions with non-standard names (e.g. `update_controller`) are not flagged.
+- Any `publish` call anywhere in the method body clears the finding, even if it is for an unrelated event.
+- Events emitted inside helper functions called by the flagged method are not tracked.
+
+**Fixture:** tests in `crates/checks/src/missing_event_for_admin_change.rs`
+
+---
+
+## `unchecked-token-amount` (Medium)
+
+**What it detects**
+
+In `#[contractimpl]` methods: calls to token transfer or mint-style functions (`transfer`, `transfer_from`, `xfer`, `mint`) where the function body contains no guard that validates the amount is greater than zero (e.g. a comparison expression, `assert!`, or `require!` involving the amount).
+
+**Why it matters**
+
+Passing a zero or negative token amount to a transfer or mint call can result in no-op state changes that silently bypass expected accounting logic, or — depending on the token implementation — an unexpected revert that leaves the contract in an inconsistent state. Explicit amount validation is a baseline defence for any financial operation.
+
+**Limitations**
+
+- Guard detection is heuristic: the check looks for a binary comparison or `assert`/`require`-style macro that references a variable named `amount`. Differently-named parameters or complex guard logic may not be recognized.
+- Does not verify that the guard precedes the transfer call in control flow, only that it appears somewhere in the function body.
+- Validation performed inside a helper function called by the flagged method is not visible to this check.
+
+**Fixture:** tests in `crates/checks/src/unchecked_token_amount.rs`
