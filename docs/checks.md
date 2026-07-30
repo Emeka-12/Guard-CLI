@@ -398,7 +398,7 @@ Without a one-time guard, an attacker can call `initialize` again to overwrite t
 
 **What it detects**
 
-Inside `#[contractimpl]` methods, any call to `env.invoke_contract(…)` that appears as a standalone expression statement (semicolon-terminated, not bound to a variable), meaning the return value is silently discarded.
+Inside `#[contractimpl]` methods, any call to `env.invoke_contract(…)` or `env.invoke_contract_check(…)` whose return value is silently discarded (standalone expression statement, bound to `_`, or bound to an unreferenced variable).
 
 **Why it matters**
 
@@ -406,10 +406,10 @@ Cross-contract calls may fail. Discarding the return value silently swallows err
 
 **Limitations**
 
-- Only flags the syntactic pattern of a bare statement; does not track data flow.
-- `let _ = env.invoke_contract(…);` suppresses the warning even though the value is technically dropped.
+- Only flags discarded or unreferenced return value bindings; does not track complex data flow.
 
 **Fixture:** `test-contracts/invoke-return-vulnerable/`, `test-contracts/invoke-return-safe/`
+
 
 ---
 

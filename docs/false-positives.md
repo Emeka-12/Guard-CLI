@@ -47,7 +47,7 @@ Common causes:
 | `missing-zero-address-check` | Validation performed by a helper function is not tracked | [checks.md#missing-zero-address-check](checks.md#missing-zero-address-check) |
 | `mutable-global-state` | None known yet | [checks.md#mutable-global-state](checks.md#mutable-global-state) |
 | `re-initialization-risk` | Any `.has()` / `.is_some()` in the body clears the finding regardless of control-flow | [checks.md#re-initialization-risk](checks.md#re-initialization-risk) |
-| `unchecked-invoke-return` | `let _ = env.invoke_contract(…)` suppresses the warning even though the value is dropped | [checks.md#unchecked-invoke-return](checks.md#unchecked-invoke-return) |
+| `unchecked-invoke-return` | Return values evaluated via complex helper methods may not be tracked | [checks.md#unchecked-invoke-return](checks.md#unchecked-invoke-return) |
 | `missing-balance-check` | `balance()` on an unrelated client clears the finding | [checks.md#missing-balance-check](checks.md#missing-balance-check) |
 | `unbounded-vec-growth` | Any `.len()` call in the function clears the finding even without a cap | [checks.md#unbounded-vec-growth](checks.md#unbounded-vec-growth) |
 | `unsafe-randomness` | `env.ledger().timestamp()` alone is flagged even if the value is never used in logic | [checks.md#unsafe-randomness](checks.md#unsafe-randomness) |
