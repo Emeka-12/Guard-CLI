@@ -583,7 +583,7 @@ In `#[contractimpl]` methods: a storage read (`.storage().<tier>().get(...)` or 
 
 **Why it matters**
 
-Reading uninitialized storage in Soroban returns `None`; calling `.unwrap()` or `.expect(...)` on it panics and aborts the contract invocation. This can brick a contract for legitimate callers or be triggered intentionally by an attacker to cause a denial of service.
+Reading uninitialized storage in Soroban returns `None`; calling `.unwrap()` or `.expect(...)` on it panics and aborts the contract invocation. This is a high-severity failure mode because it can brick a contract for legitimate callers or be triggered intentionally by an attacker to cause a denial of service.
 
 **Relationship to `panic-in-contract`**
 
