@@ -74,7 +74,11 @@ impl<'ast> Visit<'ast> for InvokeReturnScan {
                 Stmt::Local(local) => {
                     if let Some(init) = &local.init {
                         if let Some(m) = extract_invoke_contract(&init.expr) {
-                            let is_discarded = match &local.pat {
+                            let pat = match &local.pat {
+                                Pat::Type(pt) => &*pt.pat,
+                                other => other,
+                            };
+                            let is_discarded = match pat {
                                 Pat::Wild(_) => true,
                                 Pat::Ident(pi) => {
                                     let name = pi.ident.to_string();
@@ -125,6 +129,31 @@ impl<'ast, 'a> Visit<'ast> for IdentUsageVisitor<'a> {
         if ident == self.target {
             self.used = true;
         }
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        fn check_tokens(tokens: proc_macro2::TokenStream, target: &str) -> bool {
+            for tt in tokens {
+                match tt {
+                    proc_macro2::TokenTree::Ident(id) => {
+                        if id.to_string() == target {
+                            return true;
+                        }
+                    }
+                    proc_macro2::TokenTree::Group(g) => {
+                        if check_tokens(g.stream(), target) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        if check_tokens(m.tokens.clone(), &self.target.to_string()) {
+            self.used = true;
+        }
+        visit::visit_macro(self, m);
     }
 }
 
@@ -260,5 +289,20 @@ impl C {
 }
 "#);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn flags_let_underscore_with_type_invoke_contract() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Symbol, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn f(env: Env, callee: Address) {
+        let _: () = env.invoke_contract::<()>(&callee, &Symbol::short("do"), ());
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
     }
 }
