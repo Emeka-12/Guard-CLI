@@ -152,7 +152,7 @@ Soroban contracts compile to WASM with `#![no_std]`. Importing from `std` causes
 
 **What it detects**
 
-A string literal anywhere in the file that matches the shape of a Stellar `StrKey` public key — a 56-character base32 run starting with `G`, bounded by non-alphanumeric characters on both sides. Works on the raw source text rather than the parsed AST, so it catches keys regardless of which expression they appear in.
+A string literal anywhere in the file that matches the shape of a Stellar `StrKey` address — a 56-character base32 run starting with `G` (Ed25519 public key) or `C` (Soroban contract address), bounded by non-alphanumeric characters on both sides. Works on the raw source text rather than the parsed AST, so it catches addresses regardless of which expression they appear in.
 
 **Why it matters**
 
@@ -160,7 +160,7 @@ Baking a fixed account or contract address into source code breaks the contract 
 
 **Limitations**
 
-- Purely textual pattern matching — it does not verify the candidate is a valid `StrKey` checksum, so it can flag any 56-char `G...` run, including ones in comments or non-address strings that happen to match the shape.
+- Purely textual pattern matching — it does not verify the candidate is a valid `StrKey` checksum, so it can flag any 56-char `G...` or `C...` run, including ones in comments or non-address strings that happen to match the shape.
 - Does not track whether the literal is actually used to construct an `Address` (e.g. via `Address::from_str`) vs. just printed or compared.
 
 **Fixture:** `test-contracts/hardcoded-address-vulnerable/`, `test-contracts/hardcoded-address-safe/`
@@ -432,6 +432,28 @@ Attempting a transfer without verifying the sender has sufficient funds can caus
 
 ---
 
+## `unprotected-token-mint` (High)
+
+**Status:** Phase 3
+
+**What it detects**
+
+Public (`pub fn`) methods in `#[contractimpl]` whose name contains `mint`, `burn`, `issue`, `redeem`, or `create_tokens`, and whose body contains **no** call to `require_auth` or `require_auth_for_args` on any receiver.
+
+**Why it matters**
+
+Token supply operations are among the most sensitive entrypoints in a Soroban contract. Without an auth gate, any account on the Stellar network can call `mint` or `burn` directly, inflating or destroying token balances at will. This is an immediate economic exploit — comparable to a printable-money bug — and is essentially irreversible once the transaction hits the ledger.
+
+**Limitations**
+
+- Name-based heuristic only: functions that perform minting logic under a different name (e.g. `distribute`, `award`) are not detected.
+- Any `require_auth` / `require_auth_for_args` call anywhere in the method body clears the finding, even if it is inside a branch that is never reached in practice.
+- Does not verify that the caller being authenticated is actually a trusted admin; a contract that calls `require_auth()` on the wrong address still passes this check.
+
+**Fixture:** `test-contracts/token-mint-vulnerable/`, `test-contracts/token-mint-safe/`
+
+---
+
 ## `unbounded-vec-growth` (Medium)
 
 **What it detects**
@@ -583,7 +605,7 @@ In `#[contractimpl]` methods: a storage read (`.storage().<tier>().get(...)` or 
 
 **Why it matters**
 
-Reading uninitialized storage in Soroban returns `None`; calling `.unwrap()` or `.expect(...)` on it panics and aborts the contract invocation. This can brick a contract for legitimate callers or be triggered intentionally by an attacker to cause a denial of service.
+Reading uninitialized storage in Soroban returns `None`; calling `.unwrap()` or `.expect(...)` on it panics and aborts the contract invocation. This is a high-severity failure mode because it can brick a contract for legitimate callers or be triggered intentionally by an attacker to cause a denial of service.
 
 **Relationship to `panic-in-contract`**
 

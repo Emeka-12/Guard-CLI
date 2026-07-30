@@ -6,17 +6,20 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Expr, ExprCall, ExprMethodCall, File};
 
-/// Returns true when `expr` is `.get(…)`/`.get_unchecked(…)` chained onto a `.storage()`
-/// receiver — the same pattern `uninitialized_storage_read::UninitializedStorageReadCheck`
-/// reports on its own, more specific, `uninitialized-storage-read` finding. `unwrap`/`expect`
-/// calls matching this shape are left to that check instead of being double-reported here.
+/// Returns true when `expr` is **exactly** `.get(…)`/`.get_unchecked(…)` chained directly onto a
+/// `.storage()` receiver chain — the same pattern that
+/// `uninitialized_storage_read::UninitializedStorageReadCheck` reports under its own, more
+/// specific, `uninitialized-storage-read` finding. Only that single-hop pattern is suppressed
+/// here so that `.unwrap()`/`.expect()` further downstream (e.g. on the result of
+/// `.checked_mul(…)` that was itself computed from a storage read) are still reported.
+///
+/// In other words: `storage.get(&k).unwrap()` → suppressed (owned by `uninitialized-storage-read`)
+///                 `storage.get(&k).unwrap_or(0).checked_mul(x).unwrap()` → NOT suppressed here
 fn is_storage_get(expr: &Expr) -> bool {
     match expr {
         Expr::MethodCall(m) => {
-            if m.method == "get" || m.method == "get_unchecked" {
-                return receiver_chain_contains_storage(&m.receiver);
-            }
-            is_storage_get(&m.receiver)
+            (m.method == "get" || m.method == "get_unchecked")
+                && receiver_chain_contains_storage(&m.receiver)
         }
         _ => false,
     }

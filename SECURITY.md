@@ -64,6 +64,42 @@ private until a fix has been released or 90 days have elapsed, whichever comes f
 - Security issues in third-party tools or services (report those upstream)
 - Issues that require physical access to the analyst's machine
 
+## Key Rotation Procedures
+
+When a sensitive key or token requires rotation (e.g., suspected compromise, routine expiration), follow this process:
+
+### GitHub Actions Secrets
+
+1. **Generate a new secret/token** in the relevant service (crates.io, GitHub, etc.)
+2. **Create a new secret in GitHub** (Settings → Secrets → New secret) with a versioned name if keeping both temporarily (e.g., `CRATES_IO_TOKEN_V2`)
+3. **Update CI/CD workflows** to reference the new secret
+4. **Verify new workflows pass** with the new secret in place
+5. **Remove the old secret** from GitHub after confirming the new one works consistently
+6. **Document the rotation** in an internal log or team notes (do not commit to the repo)
+
+### Crates.io Publishing Keys
+
+If the publishing token to crates.io is compromised:
+
+1. **Revoke the token immediately** in your crates.io account settings
+2. **Generate a new token** with the minimum scope needed (`publish-update` only if not new crates)
+3. **Update the GitHub Actions secret** (follow the steps above)
+4. **Publish a new patch version** of affected crates with CI to confirm access
+
+### Signing Keys (Release Tags)
+
+If a GPG or SSH key used for signing releases is compromised:
+
+1. **Revoke the old key** (if using GPG, run `gpg --send-keys <key-id>` to publish revocation)
+2. **Generate a new signing key** following your authentication setup
+3. **Update git config** locally and ensure team members update theirs
+4. **Re-sign recent releases** if necessary, or document the key change in release notes
+5. **Publish the new public key** in a way your team can verify (e.g., in the repository as `MAINTAINERS.md`)
+
+### When in Doubt
+
+If you suspect a key is compromised but are uncertain about the scope, **contact a maintainer privately** before proceeding. Do not commit any secrets or keys to the repository in the process.
+
 ## Credit and Acknowledgements
 
 Reporters who responsibly disclose a valid security issue will be acknowledged in the

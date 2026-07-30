@@ -23,14 +23,63 @@ struct Cli {
     command: Commands,
 }
 
-#[contractimpl]
-impl VulnerableContract {
-    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
-    pub fn bump(env: Env) {
-        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
-        n += 1;
-        env.storage().instance().set(&KEY, &n);
-    }
+#[derive(Subcommand)]
+enum Commands {
+    /// Scan a directory tree for vulnerability patterns
+    Scan {
+        /// Path to the contract crate or folder containing Rust sources (or use path from soroban-guard.toml)
+        path: Option<PathBuf>,
+        /// Print findings as JSON (`{ "summary": {...}, "findings": [...] }`)
+        #[arg(long)]
+        json: bool,
+        /// Print findings as a SARIF 2.1.0 document
+        #[arg(long)]
+        sarif: bool,
+        /// Print findings as a Markdown table
+        #[arg(long)]
+        markdown: bool,
+        /// Write output to a file instead of stdout (applies to --json and --sarif)
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Suppress all output when there are zero High findings
+        #[arg(long)]
+        quiet: bool,
+        /// Disable colored output
+        #[arg(long)]
+        no_color: bool,
+        /// Print additional scan statistics such as skipped generated files
+        #[arg(long)]
+        verbose: bool,
+        /// Only scan files matching this glob pattern (e.g. `src/token*.rs`); may be repeated
+        #[arg(long, value_name = "PATTERN")]
+        include: Vec<String>,
+        /// Exclude files matching this glob pattern (e.g. `src/proxy.rs`); may be repeated
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+        /// Exit code 1 when findings at or above this severity are found (high|medium|low, default: high)
+        #[arg(long, default_value = "high")]
+        fail_on: String,
+        /// Disable a named check (may be repeated)
+        #[arg(long, value_name = "CHECK")]
+        disable_check: Vec<String>,
+        /// Watch for .rs file changes and re-run the scan automatically
+        #[arg(long, short = 'w')]
+        watch: bool,
+    },
+    /// List the checks that are enabled by default
+    ListChecks,
+    /// Print full documentation for a named check
+    Explain {
+        /// Name of the check (e.g. `missing-require-auth`)
+        check_name: String,
+    },
+    /// Print shell completion scripts for Bash, Zsh, Fish, or PowerShell
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
+    /// Print version and build information
+    Version,
 }
 
 /// Parameters passed to the core scan-and-print routine.
@@ -83,15 +132,21 @@ fn run_scan(
                 }
             } else if opts.sarif {
                 if !opts.quiet || should_fail {
-                    let payload =
-                        serde_json::to_string_pretty(&build_sarif(&findings)).unwrap();
-                    if let Some(ref out_path) = opts.output {
-                        if let Err(e) = write_output(out_path, &payload) {
+                    match serde_json::to_string_pretty(&build_sarif(&findings)) {
+                        Ok(payload) => {
+                            if let Some(ref out_path) = opts.output {
+                                if let Err(e) = write_output(out_path, &payload) {
+                                    eprintln!("{} {}", "error:".red().bold(), e);
+                                    return 2;
+                                }
+                            } else {
+                                println!("{payload}");
+                            }
+                        }
+                        Err(e) => {
                             eprintln!("{} {}", "error:".red().bold(), e);
                             return 2;
                         }
-                    } else {
-                        println!("{payload}");
                     }
                 }
             } else if opts.markdown {
@@ -123,7 +178,10 @@ fn run_scan(
         Err(e) => {
             if opts.json {
                 let envelope = serde_json::json!({ "error": e.to_string() });
-                println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+                match serde_json::to_string_pretty(&envelope) {
+                    Ok(payload) => println!("{}", payload),
+                    Err(json_err) => eprintln!("{} {}", "error:".red().bold(), json_err),
+                }
             } else {
                 eprintln!("{} {}", "error:".red().bold(), e);
             }
@@ -213,8 +271,30 @@ fn main() {
                 std::process::exit(2);
             }
 
+            // Try to load soroban-guard.toml from current directory to get default path.
+            let config_for_default = match config::load(&PathBuf::from(".")) {
+                Ok(c) => c.unwrap_or_default(),
+                Err(e) => {
+                    eprintln!("{} {}", "error:".red().bold(), e);
+                    std::process::exit(2);
+                }
+            };
+
+            // Resolve scan path: CLI argument takes precedence, then config, then error.
+            let scan_path = if let Some(p) = path {
+                p
+            } else if let Some(config_path) = &config_for_default.scan.path {
+                PathBuf::from(config_path)
+            } else {
+                eprintln!(
+                    "{} no scan path provided and none found in soroban-guard.toml",
+                    "error:".red().bold()
+                );
+                std::process::exit(2);
+            };
+
             // Load soroban-guard.toml from the scan root (if present).
-            let cfg = match config::load(&path) {
+            let cfg = match config::load(&scan_path) {
                 Ok(c) => c.unwrap_or_default(),
                 Err(e) => {
                     eprintln!("{} {}", "error:".red().bold(), e);
@@ -264,10 +344,60 @@ fn main() {
             let extra_sensitive = &cfg.checks.sensitive_names.extra;
             let active_checks = default_checks_with_config(&all_disabled, extra_sensitive);
 
+            let includes: Vec<String> = include;
+            match scan_directory_with_checks(&scan_path, &exclude, &includes, &active_checks) {
+                Ok((results, files_scanned, files_skipped)) => {
+                    let findings: Vec<Finding> =
+                        results.into_iter().flat_map(|r| r.findings).collect();
+                    let should_fail = findings
+                        .iter()
+                        .any(|f| f.severity <= fail_threshold);
+
+                    if json {
+                        if !quiet || should_fail {
+                            match json_payload(&findings, files_scanned) {
+                                Ok(payload) => {
+                                    if let Some(ref out_path) = output {
+                                        if let Err(e) = write_output(out_path, &payload) {
+                                            eprintln!("{} {}", "error:".red().bold(), e);
+                                            std::process::exit(2);
+                                        }
+                                    } else {
+                                        println!("{payload}");
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("{} {}", "error:".red().bold(), e);
+                                    std::process::exit(2);
+                                }
+                            }
+                        }
+                    } else if sarif {
+                        if !quiet || should_fail {
+                            let payload =
+                                serde_json::to_string_pretty(&build_sarif(&findings)).unwrap();
+                            if let Some(ref out_path) = output {
+                                if let Err(e) = write_output(out_path, &payload) {
+                                    eprintln!("{} {}", "error:".red().bold(), e);
+                                    std::process::exit(2);
+                                }
+                            } else {
+                                println!("{payload}");
+                            }
+                        }
+                    } else if markdown {
+                        if !quiet || should_fail {
+                            print_markdown(&findings);
+                        }
+                    } else if !quiet || should_fail {
+                        let (display, truncated) = truncate(&findings, 0);
+                        print_pretty(display, files_scanned, scan_path.display().to_string(), truncated);
+                    }
+
             let includes = include.clone();
             // Build a ScanOptions struct to pass around cleanly.
             let opts = ScanOptions {
-                path: path.clone(),
+                path: scan_path.clone(),
                 json,
                 sarif,
                 markdown,
@@ -293,7 +423,7 @@ fn main() {
                     "{}",
                     format!(
                         "\nWatching {} for .rs file changes. Press Ctrl-C to exit.",
-                        path.display()
+                        scan_path.display()
                     )
                     .dimmed()
                 );
@@ -606,11 +736,11 @@ fn describe_check(name: &str) -> (&'static str, &'static str) {
         "unchecked-arithmetic" => ("medium", "Flags unchecked arithmetic on contract state"),
         "unprotected-admin" => ("high", "Flags privileged entrypoints without auth"),
         "unsafe-storage-patterns" => ("medium", "Flags temporary storage and dynamic Symbol keys"),
-        "missing-ttl-extension" => ("medium", "Flags persistent storage entries without TTL extension"),
+        "missing-ttl-extension" => ("low", "Flags persistent storage entries without TTL extension"),
         "forbidden-std-imports" => ("high", "Flags use of std in no_std Soroban contracts"),
         "hardcoded-address" => ("medium", "Flags hardcoded Stellar address literals"),
         "unsafe-cross-contract-input" => ("high", "Flags unvalidated return values from cross-contract calls"),
-        "missing-contract-annotation" => ("medium", "Flags structs missing the #[contract] attribute"),
+        "missing-contract-annotation" => ("low", "Flags structs missing the #[contract] attribute"),
         "delegate-call-risk" => ("high", "Flags delegate-call patterns that transfer execution control"),
         "integer-division-truncation" => ("medium", "Flags integer division that silently truncates"),
         "missing-event-emission" => ("medium", "Flags state-mutating functions with no event emission"),
