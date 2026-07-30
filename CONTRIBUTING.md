@@ -2,6 +2,8 @@
 
 Thank you for helping improve the static analyzer. This guide covers **local setup**, a **short `syn` tutorial with examples**, **how to add a check** (using `auth.rs` as a template), and **how to write test contracts**.
 
+**Please note:** We are committed to providing a welcoming and inclusive environment for all contributors. Read our [Code of Conduct](.github/CODE_OF_CONDUCT.md) to understand our community standards.
+
 Read the [architecture overview](docs/architecture.md) first for the crate dependency graph,
 scan data flow, and core types.
 
