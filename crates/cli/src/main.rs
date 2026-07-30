@@ -519,6 +519,41 @@ fn main() {
     }
 }
 
+
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
+    }
+}
+
+
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
+    }
+}
+
+
+
+
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
+    }
+}
+
 /// Returns (slice to display, count of truncated findings).
 fn truncate(findings: &[Finding], max: usize) -> (&[Finding], usize) {
     if max == 0 || findings.len() <= max {
