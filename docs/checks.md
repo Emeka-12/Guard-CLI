@@ -512,22 +512,22 @@ Panics abort the transaction with an unhelpful, generic error and can leave the 
 
 ---
 
-## `missing-event-for-admin-change` (Medium)
+## `missing-ttl-extension` (Low)
 
 **What it detects**
 
-Public admin-mutating functions such as `set_owner`, `set_admin`, `transfer_ownership`, or `set_operator` that mutate storage but do not emit an event.
+In `#[contractimpl]` methods, writes to persistent storage (`env.storage().persistent().set(...)`, `remove(...)`, or `append(...)`) that are not followed by an `env.storage().persistent().extend_ttl(...)` call in the same function.
 
 **Why it matters**
 
-Administrative changes should be observable off-chain for auditing and monitoring. Missing events make governance actions harder to track and can leave clients with stale state.
+Persistent contract storage entries eventually expire. Without an explicit TTL extension, the ledger can archive the data and later reads may fail or behave unexpectedly.
 
 **Limitations**
 
-- Detection is name-based and heuristic rather than semantic.
-- It only looks for simple storage writes and `publish` calls in the same method body.
+- Only checks for direct persistent writes and TTL extension calls in the same function body.
+- Does not analyze helper functions or control-flow paths that extend TTL elsewhere.
 
-**Fixture:** tests in `crates/checks/src/missing_event_for_admin_change.rs`
+**Fixture:** `test-contracts/ttl-vulnerable/`, `test-contracts/ttl-safe/`
 
 ---
 
