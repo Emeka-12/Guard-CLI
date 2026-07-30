@@ -335,7 +335,6 @@ fn main() {
             let extra_sensitive = &cfg.checks.sensitive_names.extra;
             let active_checks = default_checks_with_config(&all_disabled, extra_sensitive);
 
-            let includes: Vec<String> = include.into_iter().collect();
             let includes: Vec<String> = include;
             match scan_directory_with_checks(&scan_path, &exclude, &includes, &active_checks) {
                 Ok((results, files_scanned, files_skipped)) => {
@@ -386,6 +385,7 @@ fn main() {
                         print_pretty(display, files_scanned, scan_path.display().to_string(), truncated);
                     }
 
+            let includes = include.clone();
             // Build a ScanOptions struct to pass around cleanly.
             let opts = ScanOptions {
                 path: scan_path.clone(),
@@ -397,7 +397,7 @@ fn main() {
                 verbose,
                 fail_threshold,
                 exclude: exclude.clone(),
-                includes: includes.clone(),
+                includes,
             };
 
             // Run the initial scan.
