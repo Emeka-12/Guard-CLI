@@ -25,7 +25,10 @@ disabled = ["unsafe-randomness", "reentrancy"]
 
 [checks.sensitive_names]
 # Extra function-name patterns to treat as sensitive (admin/privileged),
-# on top of the built-in list used by checks like `missing-require-auth`.
+# on top of the built-in list used exclusively by the `unprotected-admin` check.
+# Note: other checks that have their own sensitive-name lists (e.g.
+# `missing-zero-address-check`, `unprotected-upgrade`) do NOT currently
+# read this option; see the follow-up issue for potential expansion.
 extra = ["drain", "sweep", "rescue_funds"]
 ```
 
@@ -35,7 +38,7 @@ extra = ["drain", "sweep", "rescue_funds"]
 |-----|------|---------|--------|
 | `[scan] min_severity` | `"high"` \| `"medium"` \| `"low"` | unset | Same as `--fail-on`: exit `1` when a finding at or above this severity is present. |
 | `[checks] disabled` | list of strings | `[]` | Check names to skip, merged with any `--disable-check` flags. Unknown names cause the scan to exit `2`. |
-| `[checks.sensitive_names] extra` | list of strings | `[]` | Additional function-name patterns treated as privileged/admin-like, alongside the built-in `SENSITIVE_NAMES` list. |
+| `[checks.sensitive_names] extra` | list of strings | `[]` | Additional function-name patterns treated as privileged/admin-like, appended to the built-in list used **only** by `unprotected-admin`. Other checks (`missing-zero-address-check`, `unprotected-upgrade`) maintain their own separate hardcoded lists and are not affected by this option. |
 
 ## Example
 
