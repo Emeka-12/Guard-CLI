@@ -1,6 +1,9 @@
 //! Persistent storage writes that never extend the entry's TTL in the same function.
 
-use crate::util::contractimpl_functions;
+use crate::util::{
+    contractimpl_functions_excluding_test, receiver_chain_contains_persistent,
+    receiver_chain_contains_storage,
+};
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -20,7 +23,7 @@ impl Check for MissingTtlExtensionCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             let mut v = TtlVisitor {
                 mutations: Vec::new(),
@@ -54,24 +57,6 @@ impl Check for MissingTtlExtensionCheck {
             }
         }
         out
-    }
-}
-
-fn receiver_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => m.method == "storage" || receiver_chain_contains_storage(&m.receiver),
-        Expr::Field(f) => receiver_chain_contains_storage(&f.base),
-        _ => false,
-    }
-}
-
-fn receiver_chain_contains_persistent(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            m.method == "persistent" || receiver_chain_contains_persistent(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_persistent(&f.base),
-        _ => false,
     }
 }
 

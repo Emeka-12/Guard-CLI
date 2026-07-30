@@ -2,6 +2,8 @@
 
 Thank you for helping improve the static analyzer. This guide covers **local setup**, a **short `syn` tutorial with examples**, **how to add a check** (using `auth.rs` as a template), and **how to write test contracts**.
 
+**Please note:** We are committed to providing a welcoming and inclusive environment for all contributors. Read our [Code of Conduct](.github/CODE_OF_CONDUCT.md) to understand our community standards.
+
 Read the [architecture overview](docs/architecture.md) first for the crate dependency graph,
 scan data flow, and core types.
 
@@ -142,6 +144,11 @@ Use [`crates/checks/src/auth.rs`](crates/checks/src/auth.rs) as the canonical la
 5. **Unit tests** — In `my_rule.rs`, add `#[test] fn ...() -> Result<(), syn::Error>` and use `parse_file(src)?` so parse failures surface as test errors instead of panics.
 
 6. **Fixture crates** — Add `test-contracts/<rule>-vulnerable/` and `test-contracts/<rule>-safe/` (see below).
+
+7. **Update the all-findings example** — `CHANGELOG.md` claims `examples/all-findings/src/lib.rs`
+   "intentionally triggers every default check." Add a function there demonstrating your new rule
+   (with a `// Triggers <rule-name>` comment) so that claim stays true — this is easy to forget
+   since nothing enforces it automatically.
 
 ---
 

@@ -3,12 +3,14 @@ mod config;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use colored::Colorize;
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use soroban_guard_analyzer::scan_directory_with_checks;
 use soroban_guard_checks::{default_checks, default_checks_with_config, Finding, Severity};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 #[derive(Parser)]
 #[command(name = "soroban-guard")]
@@ -25,8 +27,8 @@ struct Cli {
 enum Commands {
     /// Scan a directory tree for vulnerability patterns
     Scan {
-        /// Path to the contract crate or folder containing Rust sources
-        path: PathBuf,
+        /// Path to the contract crate or folder containing Rust sources (or use path from soroban-guard.toml)
+        path: Option<PathBuf>,
         /// Print findings as JSON (`{ "summary": {...}, "findings": [...] }`)
         #[arg(long)]
         json: bool,
@@ -48,33 +50,24 @@ enum Commands {
         /// Print additional scan statistics such as skipped generated files
         #[arg(long)]
         verbose: bool,
-        /// Only scan files matching this glob pattern (e.g. `src/token*.rs`)
-        #[arg(long)]
-        include: Option<String>,
+        /// Only scan files matching this glob pattern (e.g. `src/token*.rs`); may be repeated
+        #[arg(long, value_name = "PATTERN")]
+        include: Vec<String>,
+        /// Exclude files matching this glob pattern (e.g. `src/proxy.rs`); may be repeated
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
         /// Exit code 1 when findings at or above this severity are found (high|medium|low, default: high)
         #[arg(long, default_value = "high")]
         fail_on: String,
         /// Disable a named check (may be repeated)
         #[arg(long, value_name = "CHECK")]
         disable_check: Vec<String>,
-        /// Disable ANSI color output (equivalent to setting NO_COLOR=1)
-        #[arg(long)]
-        no_color: bool,
+        /// Watch for .rs file changes and re-run the scan automatically
+        #[arg(long, short = 'w')]
+        watch: bool,
     },
     /// List the checks that are enabled by default
     ListChecks,
-    /// Explain a check by name
-    Explain {
-        /// Check name to explain
-        check_name: String,
-    },
-    /// Generate shell completions
-    Completions {
-        /// Shell to generate completions for
-        shell: Shell,
-    },
-    /// Print version and build information
-    Version,
     /// Print full documentation for a named check
     Explain {
         /// Name of the check (e.g. `missing-require-auth`)
@@ -85,6 +78,166 @@ enum Commands {
         /// Shell to generate completions for
         shell: Shell,
     },
+    /// Print version and build information
+    Version,
+}
+
+/// Parameters passed to the core scan-and-print routine.
+struct ScanOptions {
+    path: PathBuf,
+    json: bool,
+    sarif: bool,
+    markdown: bool,
+    output: Option<PathBuf>,
+    quiet: bool,
+    verbose: bool,
+    fail_threshold: Severity,
+    exclude: Vec<String>,
+    includes: Vec<String>,
+}
+
+/// Run a single scan and print its results.
+/// Returns the exit code that would normally be passed to `std::process::exit`
+/// (0 = pass, 1 = findings above threshold, 2 = I/O error).
+fn run_scan(
+    opts: &ScanOptions,
+    active_checks: &[Box<dyn soroban_guard_checks::Check + Send + Sync>],
+) -> i32 {
+    match scan_directory_with_checks(&opts.path, &opts.exclude, &opts.includes, active_checks) {
+        Ok((results, files_scanned, files_skipped)) => {
+            let findings: Vec<Finding> =
+                results.into_iter().flat_map(|r| r.findings).collect();
+            let should_fail = findings
+                .iter()
+                .any(|f| f.severity <= opts.fail_threshold);
+
+            if opts.json {
+                if !opts.quiet || should_fail {
+                    match json_payload(&findings, files_scanned) {
+                        Ok(payload) => {
+                            if let Some(ref out_path) = opts.output {
+                                if let Err(e) = write_output(out_path, &payload) {
+                                    eprintln!("{} {}", "error:".red().bold(), e);
+                                    return 2;
+                                }
+                            } else {
+                                println!("{payload}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{} {}", "error:".red().bold(), e);
+                            return 2;
+                        }
+                    }
+                }
+            } else if opts.sarif {
+                if !opts.quiet || should_fail {
+                    match serde_json::to_string_pretty(&build_sarif(&findings)) {
+                        Ok(payload) => {
+                            if let Some(ref out_path) = opts.output {
+                                if let Err(e) = write_output(out_path, &payload) {
+                                    eprintln!("{} {}", "error:".red().bold(), e);
+                                    return 2;
+                                }
+                            } else {
+                                println!("{payload}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{} {}", "error:".red().bold(), e);
+                            return 2;
+                        }
+                    }
+                }
+            } else if opts.markdown {
+                if !opts.quiet || should_fail {
+                    print_markdown(&findings);
+                }
+            } else if !opts.quiet || should_fail {
+                let (display, truncated) = truncate(&findings, 0);
+                print_pretty(
+                    display,
+                    files_scanned,
+                    opts.path.display().to_string(),
+                    truncated,
+                );
+            }
+
+            if opts.verbose {
+                eprintln!("Scanned {} file(s).", files_scanned);
+                if files_skipped > 0 {
+                    eprintln!(
+                        "Skipped {} generated file(s) from analysis.",
+                        files_skipped
+                    );
+                }
+            }
+
+            if should_fail { 1 } else { 0 }
+        }
+        Err(e) => {
+            if opts.json {
+                let envelope = serde_json::json!({ "error": e.to_string() });
+                match serde_json::to_string_pretty(&envelope) {
+                    Ok(payload) => println!("{}", payload),
+                    Err(json_err) => eprintln!("{} {}", "error:".red().bold(), json_err),
+                }
+            } else {
+                eprintln!("{} {}", "error:".red().bold(), e);
+            }
+            2
+        }
+    }
+}
+
+/// Returns a UTC timestamp string like "2026-07-28 23:09:36" without any
+/// external date crate.
+fn chrono_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    let (year, month, day) = days_to_ymd(days);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, h, m, s
+    )
+}
+
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    let mut year = 1970u64;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let months: [u64; 12] = [
+        31,
+        if is_leap(year) { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut month = 1u64;
+    for &dim in &months {
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    (year, month, days + 1)
+}
+
+fn is_leap(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 fn main() {
@@ -100,11 +253,12 @@ fn main() {
             no_color,
             verbose,
             include,
+            exclude,
             fail_on,
             disable_check,
-            no_color,
+            watch,
         } => {
-            if no_color {
+            if no_color || std::env::var_os("NO_COLOR").is_some() {
                 colored::control::set_override(false);
             }
             // Mutual exclusion
@@ -117,8 +271,30 @@ fn main() {
                 std::process::exit(2);
             }
 
+            // Try to load soroban-guard.toml from current directory to get default path.
+            let config_for_default = match config::load(&PathBuf::from(".")) {
+                Ok(c) => c.unwrap_or_default(),
+                Err(e) => {
+                    eprintln!("{} {}", "error:".red().bold(), e);
+                    std::process::exit(2);
+                }
+            };
+
+            // Resolve scan path: CLI argument takes precedence, then config, then error.
+            let scan_path = if let Some(p) = path {
+                p
+            } else if let Some(config_path) = &config_for_default.scan.path {
+                PathBuf::from(config_path)
+            } else {
+                eprintln!(
+                    "{} no scan path provided and none found in soroban-guard.toml",
+                    "error:".red().bold()
+                );
+                std::process::exit(2);
+            };
+
             // Load soroban-guard.toml from the scan root (if present).
-            let cfg = match config::load(&path) {
+            let cfg = match config::load(&scan_path) {
                 Ok(c) => c.unwrap_or_default(),
                 Err(e) => {
                     eprintln!("{} {}", "error:".red().bold(), e);
@@ -138,8 +314,7 @@ fn main() {
                 _ => Severity::High,
             };
 
-            // Merge config disabled list with --disable-check flags (CLI takes precedence /
-            // union: both sources contribute to the disabled set).
+            // Merge config disabled list with --disable-check flags.
             let mut all_disabled: Vec<String> = cfg.checks.disabled.clone();
             for name in &disable_check {
                 if !all_disabled.contains(name) {
@@ -169,9 +344,11 @@ fn main() {
             let extra_sensitive = &cfg.checks.sensitive_names.extra;
             let active_checks = default_checks_with_config(&all_disabled, extra_sensitive);
 
-            let includes: Vec<String> = include.into_iter().collect();
-            match scan_directory_with_checks(&path, &[], &includes, &active_checks) {
-                Ok((findings, files_scanned, files_skipped)) => {
+            let includes: Vec<String> = include;
+            match scan_directory_with_checks(&scan_path, &exclude, &includes, &active_checks) {
+                Ok((results, files_scanned, files_skipped)) => {
+                    let findings: Vec<Finding> =
+                        results.into_iter().flat_map(|r| r.findings).collect();
                     let should_fail = findings
                         .iter()
                         .any(|f| f.severity <= fail_threshold);
@@ -212,37 +389,95 @@ fn main() {
                         if !quiet || should_fail {
                             print_markdown(&findings);
                         }
-                    } else {
-                        if !quiet || should_fail {
-                            let (display, truncated) = truncate(&findings, 0);
-                            print_pretty(
-                                display,
-                                files_scanned,
-                                path.display().to_string(),
-                                truncated,
-                            );
+                    } else if !quiet || should_fail {
+                        let (display, truncated) = truncate(&findings, 0);
+                        print_pretty(display, files_scanned, scan_path.display().to_string(), truncated);
+                    }
+
+            let includes = include.clone();
+            // Build a ScanOptions struct to pass around cleanly.
+            let opts = ScanOptions {
+                path: scan_path.clone(),
+                json,
+                sarif,
+                markdown,
+                output: output.clone(),
+                quiet,
+                verbose,
+                fail_threshold,
+                exclude: exclude.clone(),
+                includes,
+            };
+
+            // Run the initial scan.
+            let exit_code = run_scan(&opts, &active_checks);
+
+            if !watch {
+                // Not in watch mode — preserve original exit-code behaviour.
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+            } else {
+                // Watch mode: set up a notify watcher, block until Ctrl-C.
+                eprintln!(
+                    "{}",
+                    format!(
+                        "\nWatching {} for .rs file changes. Press Ctrl-C to exit.",
+                        scan_path.display()
+                    )
+                    .dimmed()
+                );
+
+                let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+
+                let mut watcher =
+                    notify::recommended_watcher(move |res| {
+                        let _ = tx.send(res);
+                    })
+                    .unwrap_or_else(|e| {
+                        eprintln!("{} failed to create file watcher: {}", "error:".red().bold(), e);
+                        std::process::exit(2);
+                    });
+
+                watcher
+                    .watch(&path, RecursiveMode::Recursive)
+                    .unwrap_or_else(|e| {
+                        eprintln!("{} failed to watch path: {}", "error:".red().bold(), e);
+                        std::process::exit(2);
+                    });
+
+                for res in rx {
+                    match res {
+                        Ok(event) => {
+                            // Only react to create/modify events on .rs files.
+                            let is_relevant = matches!(
+                                event.kind,
+                                EventKind::Create(_) | EventKind::Modify(_)
+                            ) && event.paths.iter().any(|p| {
+                                p.extension().map(|e| e == "rs").unwrap_or(false)
+                            });
+
+                            if is_relevant {
+                                // Clear terminal for a clean view.
+                                print!("\x1B[2J\x1B[1;1H");
+
+                                // Print a timestamped re-scan header.
+                                let now = chrono_timestamp();
+                                eprintln!(
+                                    "{}",
+                                    format!("[{}] File changed — re-scanning...", now)
+                                        .cyan()
+                                        .bold()
+                                );
+
+                                run_scan(&opts, &active_checks);
+                                // In watch mode we never exit on findings — keep watching.
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{} watcher error: {}", "error:".red().bold(), e);
                         }
                     }
-
-                    if verbose && files_skipped > 0 {
-                        eprintln!(
-                            "Skipped {} generated file(s) from analysis.",
-                            files_skipped
-                        );
-                    }
-
-                    if should_fail {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    if json {
-                        let envelope = serde_json::json!({ "error": e.to_string() });
-                        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
-                    } else {
-                        eprintln!("{} {}", "error:".red().bold(), e);
-                    }
-                    std::process::exit(2);
                 }
             }
         }
@@ -284,11 +519,38 @@ fn main() {
     }
 }
 
-fn parse_severity(s: &str) -> Severity {
-    match s.to_lowercase().as_str() {
-        "high" => Severity::High,
-        "medium" => Severity::Medium,
-        _ => Severity::Low,
+
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
+    }
+}
+
+
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
+    }
+}
+
+
+
+
+#[contractimpl]
+impl VulnerableContract {
+    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
+    pub fn bump(env: Env) {
+        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
+        n += 1;
+        env.storage().instance().set(&KEY, &n);
     }
 }
 
@@ -298,19 +560,6 @@ fn truncate(findings: &[Finding], max: usize) -> (&[Finding], usize) {
         (findings, 0)
     } else {
         (&findings[..max], findings.len() - max)
-    }
-}
-
-fn emit_gha_annotations(findings: &[Finding]) {
-    for f in findings {
-        let level = match f.severity {
-            Severity::High => "error",
-            Severity::Medium | Severity::Low => "warning",
-        };
-        println!(
-            "::{} file={},line={},title={}::{}",
-            level, f.file_path, f.line, f.check_name, f.description
-        );
     }
 }
 
@@ -324,7 +573,7 @@ fn build_sarif(findings: &[Finding]) -> serde_json::Value {
                 "shortDescription": { "text": describe_rule(&finding.check_name) },
                 "fullDescription": { "text": describe_rule(&finding.check_name) },
                 "defaultConfiguration": { "level": severity_to_sarif_level(finding.severity) },
-                "helpUri": "https://github.com/chindosunday/Guard-CLI"
+                "helpUri": "https://github.com/SorobanGuard/Guard-CLI"
             }));
         }
     }
@@ -352,7 +601,7 @@ fn build_sarif(findings: &[Finding]) -> serde_json::Value {
             "tool": {
                 "driver": {
                     "name": "soroban-guard",
-                    "informationUri": "https://github.com/chindosunday/Guard-CLI",
+                    "informationUri": "https://github.com/SorobanGuard/Guard-CLI",
                     "rules": rules
                 }
             },
@@ -366,80 +615,6 @@ fn severity_to_sarif_level(severity: Severity) -> &'static str {
         Severity::High => "error",
         Severity::Medium => "warning",
         Severity::Low => "note",
-    }
-}
-
-fn describe_rule(name: &str) -> &'static str {
-    match name {
-        "missing-require-auth" => "Method writes to storage without env.require_auth()",
-        "unchecked-arithmetic" => "Wrapping arithmetic operations may overflow",
-        "unprotected-admin" => "Sensitive admin entrypoints lack an authorization gate",
-        "unsafe-storage-patterns" => "Temporary storage or dynamic Symbol keys are risky",
-        "missing-ttl-extension" => "Persistent entries may expire without TTL bump",
-        "forbidden-std-imports" => "Crate imports std which is forbidden in no_std contracts",
-        "hardcoded-address" => "Contract contains a hardcoded Stellar address string",
-        "unsafe-cross-contract-input" => "Cross-contract call return value used without validation",
-        "missing-contract-annotation" => "Struct missing #[contract] annotation",
-        "delegate-call-risk" => "Delegate-style call pattern can transfer control unexpectedly",
-        "integer-division-truncation" => "Integer division silently truncates the remainder",
-        "missing-event-emission" => "State-mutating function emits no events",
-        "symbol-key-collision" => "Multiple storage keys share the same Symbol value",
-        "self-transfer" => "Token transfer destination may equal the sender",
-        "missing-zero-address-check" => "Address argument not validated against the zero address",
-        "mutable-global-state" => "Mutable global state is unsafe and not persisted on-chain",
-        "re-initialization-risk" => "Initializer-like function can overwrite critical state",
-        "unchecked-invoke-return" => "Cross-contract invocation result is discarded",
-        "missing-balance-check" => "Token transfer occurs without a balance or authorization check",
-        "unbounded-vec-growth" => "Storage-backed Vec can grow without a bound",
-        "unsafe-randomness" => "Ledger data is used as a randomness source",
-        "unchecked-divisor" => "Division uses a runtime divisor without a zero guard",
-        "reentrancy-risk" => "Storage write followed by cross-contract invocation risks reentrancy",
-        "panic-in-contract" => "Contract uses panic!, unwrap, or expect which abort the WASM execution",
-        "mutable-global-state" => "Mutable static declarations at module scope are unsafe in Soroban",
-        "re-initialization-risk" => "Init functions should guard against re-entry",
-        "unchecked-invoke-return" => "Cross-contract calls must have their return values checked",
-        "missing-balance-check" => "Token transfers should verify sufficient balance",
-        "unbounded-vec-growth" => "Vecs in storage must have bounded growth to avoid ledger limits",
-        "unsafe-randomness" => "Timestamp and sequence are predictable, not random",
-        "unchecked-divisor" => "Divisor must be validated to be non-zero",
-        _ => "Custom check",
-    }
-}
-
-fn describe_check(name: &str) -> (&'static str, &'static str) {
-    match name {
-        "missing-require-auth" => ("high", "Missing env.require_auth() before storage writes"),
-        "unchecked-arithmetic" => ("medium", "Flags unchecked arithmetic on contract state"),
-        "unprotected-admin" => ("high", "Flags privileged entrypoints without auth"),
-        "unsafe-storage-patterns" => ("medium", "Flags temporary storage and dynamic Symbol keys"),
-        "missing-ttl-extension" => ("medium", "Flags persistent storage entries without TTL extension"),
-        "forbidden-std-imports" => ("high", "Flags use of std in no_std Soroban contracts"),
-        "hardcoded-address" => ("medium", "Flags hardcoded Stellar address literals"),
-        "unsafe-cross-contract-input" => ("high", "Flags unvalidated return values from cross-contract calls"),
-        "missing-contract-annotation" => ("medium", "Flags structs missing the #[contract] attribute"),
-        "delegate-call-risk" => ("high", "Flags delegate-call patterns that transfer execution control"),
-        "integer-division-truncation" => ("medium", "Flags integer division that silently truncates"),
-        "missing-event-emission" => ("medium", "Flags state-mutating functions with no event emission"),
-        "symbol-key-collision" => ("medium", "Flags storage keys that share the same Symbol value"),
-        "self-transfer" => ("medium", "Flags token transfers where sender may equal receiver"),
-        "missing-zero-address-check" => ("medium", "Flags Address parameters not checked for the zero address"),
-        "mutable-global-state" => ("high", "Flags mutable global state in contract code"),
-        "re-initialization-risk" => ("high", "Flags initializer-like functions without re-init guards"),
-        "unchecked-invoke-return" => ("medium", "Flags discarded cross-contract call return values"),
-        "missing-balance-check" => ("high", "Flags token transfers without balance or authorization checks"),
-        "unbounded-vec-growth" => ("medium", "Flags storage-backed Vec growth without a length cap"),
-        "unsafe-randomness" => ("high", "Flags ledger timestamp or sequence as randomness"),
-        "unchecked-divisor" => ("high", "Flags division by runtime values without zero guards"),
-        "reentrancy-risk" => ("high", "Flags storage writes followed by cross-contract calls"),
-        "panic-in-contract" => ("medium", "Flags panic!, unwrap, and expect in contract methods"),
-        "mutable-global-state" => ("high", "Flags mutable static declarations at module scope"),
-        "re-initialization-risk" => ("high", "Flags init functions without re-entry guards"),
-        "unchecked-invoke-return" => ("medium", "Flags invoke_contract calls with ignored return values"),
-        "missing-balance-check" => ("high", "Flags token transfers without balance validation"),
-        "unbounded-vec-growth" => ("medium", "Flags Vecs that grow without bounds"),
-        "unsafe-randomness" => ("high", "Flags use of timestamp/sequence as randomness"),
-        "unchecked-divisor" => ("high", "Flags division operations with unchecked divisors"),
-        _ => ("low", "Custom detector"),
     }
 }
 
@@ -512,6 +687,86 @@ fn explain_details(name: &str) -> &'static str {
             "Reports division by runtime values without an apparent non-zero guard."
         }
         _ => "No detailed explanation is available for this custom check.",
+    }
+}
+
+fn describe_rule(name: &str) -> &'static str {
+    match name {
+        "missing-require-auth" => "Method writes to storage without env.require_auth()",
+        "unchecked-arithmetic" => "Wrapping arithmetic operations may overflow",
+        "unprotected-admin" => "Sensitive admin entrypoints lack an authorization gate",
+        "unsafe-storage-patterns" => "Temporary storage or dynamic Symbol keys are risky",
+        "missing-ttl-extension" => "Persistent entries may expire without TTL bump",
+        "forbidden-std-imports" => "Crate imports std which is forbidden in no_std contracts",
+        "hardcoded-address" => "Contract contains a hardcoded Stellar address string",
+        "unsafe-cross-contract-input" => "Cross-contract call return value used without validation",
+        "missing-contract-annotation" => "Struct missing #[contract] annotation",
+        "delegate-call-risk" => "Delegate-style call pattern can transfer control unexpectedly",
+        "integer-division-truncation" => "Integer division silently truncates the remainder",
+        "missing-event-emission" => "State-mutating function emits no events",
+        "symbol-key-collision" => "Multiple storage keys share the same Symbol value",
+        "self-transfer" => "Token transfer destination may equal the sender",
+        "missing-zero-address-check" => "Address argument not validated against the zero address",
+        "mutable-global-state" => "Mutable global state is unsafe and not persisted on-chain",
+        "re-initialization-risk" => "Initializer-like function can overwrite critical state",
+        "unchecked-invoke-return" => "Cross-contract invocation result is discarded",
+        "missing-balance-check" => "Token transfer occurs without a balance or authorization check",
+        "unbounded-vec-growth" => "Storage-backed Vec can grow without a bound",
+        "unsafe-randomness" => "Ledger data is used as a randomness source",
+        "unchecked-divisor" => "Division uses a runtime divisor without a zero guard",
+        "reentrancy-risk" => "Storage write followed by cross-contract invocation risks reentrancy",
+        "panic-in-contract" => "Contract uses panic!, unwrap, or expect which abort the WASM execution",
+        "unprotected-upgrade" => "Contract upgrade entrypoint lacks an authorization gate",
+        "unprotected-token-mint" => "Token mint entrypoint lacks an authorization gate",
+        "unprotected-contract-deployment" => "Contract deployment call lacks an authorization gate",
+        "unchecked-token-amount" => "Token amount used without validation",
+        "large-loop" => "Loop may iterate over an unbounded collection",
+        "missing-nonce" => "Function susceptible to replay attacks lacks a nonce check",
+        "uninitialized-storage-read" => "Storage value read without checking if it has been initialized",
+        "missing-event-for-admin-change" => "Admin-state change emits no event for off-chain indexers",
+        "missing-input-length-bound" => "Input collection used without a length bound check",
+        "auth-after-storage-write" => "Authorization check occurs after a storage write",
+        _ => "Custom check",
+    }
+}
+
+fn describe_check(name: &str) -> (&'static str, &'static str) {
+    match name {
+        "missing-require-auth" => ("high", "Missing env.require_auth() before storage writes"),
+        "unchecked-arithmetic" => ("medium", "Flags unchecked arithmetic on contract state"),
+        "unprotected-admin" => ("high", "Flags privileged entrypoints without auth"),
+        "unsafe-storage-patterns" => ("medium", "Flags temporary storage and dynamic Symbol keys"),
+        "missing-ttl-extension" => ("low", "Flags persistent storage entries without TTL extension"),
+        "forbidden-std-imports" => ("high", "Flags use of std in no_std Soroban contracts"),
+        "hardcoded-address" => ("medium", "Flags hardcoded Stellar address literals"),
+        "unsafe-cross-contract-input" => ("high", "Flags unvalidated return values from cross-contract calls"),
+        "missing-contract-annotation" => ("low", "Flags structs missing the #[contract] attribute"),
+        "delegate-call-risk" => ("high", "Flags delegate-call patterns that transfer execution control"),
+        "integer-division-truncation" => ("medium", "Flags integer division that silently truncates"),
+        "missing-event-emission" => ("medium", "Flags state-mutating functions with no event emission"),
+        "symbol-key-collision" => ("medium", "Flags storage keys that share the same Symbol value"),
+        "self-transfer" => ("medium", "Flags token transfers where sender may equal receiver"),
+        "missing-zero-address-check" => ("medium", "Flags Address parameters not checked for the zero address"),
+        "mutable-global-state" => ("high", "Flags mutable global state in contract code"),
+        "re-initialization-risk" => ("high", "Flags initializer-like functions without re-init guards"),
+        "unchecked-invoke-return" => ("medium", "Flags discarded cross-contract call return values"),
+        "missing-balance-check" => ("high", "Flags token transfers without balance or authorization checks"),
+        "unbounded-vec-growth" => ("medium", "Flags storage-backed Vec growth without a length cap"),
+        "unsafe-randomness" => ("high", "Flags ledger timestamp or sequence as randomness"),
+        "unchecked-divisor" => ("high", "Flags division by runtime values without zero guards"),
+        "reentrancy-risk" => ("high", "Flags storage writes followed by cross-contract calls"),
+        "panic-in-contract" => ("medium", "Flags panic!, unwrap, and expect in contract methods"),
+        "unprotected-upgrade" => ("high", "Flags upgrade entrypoints without authorization"),
+        "unprotected-token-mint" => ("high", "Flags token mint entrypoints without authorization"),
+        "unprotected-contract-deployment" => ("high", "Flags contract deployment calls without authorization"),
+        "unchecked-token-amount" => ("medium", "Flags token amounts used without validation"),
+        "large-loop" => ("medium", "Flags loops over unbounded collections"),
+        "missing-nonce" => ("medium", "Flags functions susceptible to replay attacks"),
+        "uninitialized-storage-read" => ("medium", "Flags storage reads without initialization checks"),
+        "missing-event-for-admin-change" => ("medium", "Flags admin changes with no event emission"),
+        "missing-input-length-bound" => ("medium", "Flags input collections without length bound checks"),
+        "auth-after-storage-write" => ("high", "Flags authorization checks after storage writes"),
+        _ => ("low", "Custom detector"),
     }
 }
 
@@ -622,6 +877,14 @@ fn hyperlink(url: &str, text: &str) -> String {
     }
 }
 
+fn style_check_name(check_name: &str, severity: Severity) -> String {
+    match severity {
+        Severity::High => check_name.red().bold().to_string(),
+        Severity::Medium => check_name.magenta().to_string(),
+        Severity::Low => check_name.white().dimmed().to_string(),
+    }
+}
+
 fn print_pretty(
     findings: &[Finding],
     files_scanned: usize,
@@ -652,11 +915,7 @@ fn print_pretty(
                 Severity::Medium => "MEDIUM".magenta().bold(),
                 Severity::Low => "LOW".white(),
             };
-            let check = match f.severity {
-                Severity::High => f.check_name.red(),
-                Severity::Medium => f.check_name.magenta(),
-                Severity::Low => f.check_name.white(),
-            };
+            let check = style_check_name(&f.check_name, f.severity);
             println!(
                 "  {}  {}  {}  {}",
                 format!("[{}]", i + 1).dimmed(),
@@ -696,6 +955,7 @@ fn print_pretty(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use colored::control;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_finding(check_name: &str, severity: Severity, line: usize) -> Finding {
@@ -866,6 +1126,16 @@ mod tests {
             summary_text(&findings, 6),
             "1 High, 1 Medium, 0 Low — across 6 file(s)"
         );
+    }
+
+    #[test]
+    fn check_name_styling_is_bold_for_high_and_dimmed_for_low() {
+        control::set_override(true);
+        let high = style_check_name("high-check", Severity::High);
+        let low = style_check_name("low-check", Severity::Low);
+
+        assert!(high.contains("\u{1b}[1m"), "high check name should be bold");
+        assert!(low.contains("\u{1b}[2m"), "low check name should be dimmed");
     }
 
     #[test]

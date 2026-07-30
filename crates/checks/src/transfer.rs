@@ -4,7 +4,7 @@
 //! recipient are the same address. This heuristic flags `#[contractimpl]` methods whose
 //! name contains "transfer" and whose body lacks an explicit sender-recipient comparison.
 
-use crate::util::contractimpl_functions;
+use crate::util::contractimpl_functions_excluding_test;
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -23,7 +23,7 @@ impl Check for SelfTransferCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             if !fn_name.contains("transfer") {
                 continue;
@@ -34,7 +34,7 @@ impl Check for SelfTransferCheck {
             let line = method.sig.fn_token.span().start().line;
             out.push(Finding {
                 check_name: CHECK_NAME.to_string(),
-                severity: Severity::Low,
+                severity: Severity::Medium,
                 file_path: String::new(),
                 line,
                 function_name: fn_name.clone(),
@@ -140,6 +140,7 @@ impl C {
         )?;
         let hits = SelfTransferCheck.run(&file, "");
         assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Medium);
         assert_eq!(hits[0].function_name, "transfer");
         Ok(())
     }

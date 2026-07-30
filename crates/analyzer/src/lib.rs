@@ -4,15 +4,111 @@
 //! findings are concatenated with no shared mutable state between checks.
 
 use rayon::prelude::*;
+use soroban_guard_checks::util::contractimpl_functions_with_type_excluding_test;
 use soroban_guard_checks::{default_checks, Check, Finding};
 use std::collections::HashSet;
 use std::io::BufRead;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use syn::spanned::Spanned;
 use thiserror::Error;
 use walkdir::WalkDir;
 
 const SUPPRESSION_PREFIX: &str = "// soroban-guard: allow(";
+
+/// The source line range of one `#[contractimpl]` method, paired with its enclosing type's
+/// name — used to scope function-level suppressions to the specific `impl` block they were
+/// written above, instead of matching any same-named method anywhere in the file.
+struct FnSpan {
+    impl_type: String,
+    function_name: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn explain_details(name: &str) -> &'static str {
+    match name {
+        "missing-require-auth" => {
+            "Reports contract methods that mutate storage without calling require_auth or require_auth_for_args."
+        }
+        "unchecked-arithmetic" => {
+            "Reports wrapping +, -, *, and compound arithmetic in contract methods; prefer checked_* or saturating_* APIs."
+        }
+        "unprotected-admin" => {
+            "Reports public admin-like entrypoints such as set_owner, pause, migrate, or upgrade when they lack an auth gate."
+        }
+        "unsafe-storage-patterns" => {
+            "Reports temporary storage mutations and dynamic Symbol keys that may expire unexpectedly or collide."
+        }
+        "missing-ttl-extension" => {
+            "Reports persistent storage writes that do not extend TTL in the same function."
+        }
+        "forbidden-std-imports" => {
+            "Reports std imports in Soroban contract files because deployable contracts must compile for no_std WASM."
+        }
+        "hardcoded-address" => {
+            "Reports Stellar public-key-shaped string literals embedded directly in source."
+        }
+        "unsafe-cross-contract-input" => {
+            "Reports invoke_contract return values stored directly without local validation."
+        }
+        "missing-contract-annotation" => {
+            "Reports contractimpl blocks without a sibling struct annotated with #[contract]."
+        }
+        "delegate-call-risk" => {
+            "Reports storage-derived cross-contract callees that can redirect execution if storage is poisoned."
+        }
+        "integer-division-truncation" => {
+            "Reports integer division where truncation may silently change financial or accounting results."
+        }
+        "missing-event-emission" => {
+            "Reports state-mutating functions that do not publish events for off-chain indexers."
+        }
+        "symbol-key-collision" => {
+            "Reports duplicate symbol_short! keys in the same impl block."
+        }
+        "self-transfer" => {
+            "Reports transfer-like functions that do not guard against sender and recipient being equal."
+        }
+        "missing-zero-address-check" => {
+            "Reports Address parameters stored or used without checking for default or zero-address values."
+        }
+        "mutable-global-state" => {
+            "Reports static mut items, which are unsafe and not valid persistent contract state."
+        }
+        "re-initialization-risk" => {
+            "Reports initializer-like methods that write state without checking whether initialization already happened."
+        }
+        "unchecked-invoke-return" => {
+            "Reports bare invoke_contract statements whose return values are discarded."
+        }
+        "missing-balance-check" => {
+            "Reports token transfer calls that lack a preceding balance or authorization check."
+        }
+        "unbounded-vec-growth" => {
+            "Reports storage-backed Vec values pushed and written back without an apparent length cap."
+        }
+        "unsafe-randomness" => {
+            "Reports ledger timestamp or sequence usage as a randomness source."
+        }
+        "unchecked-divisor" => {
+            "Reports division by runtime values without an apparent non-zero guard."
+        }
+        _ => "No detailed explanation is available for this custom check.",
+    }
+}
+
+fn build_fn_spans(file: &syn::File) -> Vec<FnSpan> {
+    contractimpl_functions_with_type_excluding_test(file)
+        .into_iter()
+        .map(|(impl_type, method)| FnSpan {
+            impl_type,
+            function_name: method.sig.ident.to_string(),
+            start_line: method.sig.ident.span().start().line,
+            end_line: method.block.span().end().line,
+        })
+        .collect()
+}
 
 #[derive(Error, Debug)]
 pub enum ScanError {
@@ -28,12 +124,16 @@ pub enum ScanError {
         path: PathBuf,
         message: String,
     },
+    #[error("Invalid glob pattern `{pattern}`: {reason}")]
+    InvalidGlobPattern { pattern: String, reason: String },
 }
 
 #[derive(Default)]
 struct Suppressions {
     line_checks: HashSet<(usize, String)>,
-    function_checks: HashSet<(String, String)>,
+    /// Keyed on `(impl_type, function_name, check_name)` so a suppression above one
+    /// `#[contractimpl]` method doesn't also silence a same-named method on a different type.
+    function_checks: HashSet<(String, String, String)>,
 }
 
 fn has_generated_file_header(path: &Path) -> Result<bool, std::io::Error> {
@@ -82,7 +182,7 @@ fn function_name_from_line(line: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-fn parse_suppressions(source: &str) -> Suppressions {
+fn parse_suppressions(source: &str, fn_spans: &[FnSpan]) -> Suppressions {
     let lines: Vec<&str> = source.lines().collect();
     let mut suppressions = Suppressions::default();
 
@@ -95,10 +195,16 @@ fn parse_suppressions(source: &str) -> Suppressions {
             continue;
         };
         if let Some(function_name) = function_name_from_line(target_line) {
+            let target_line_number = target_idx + 1;
+            let impl_type = fn_spans
+                .iter()
+                .find(|s| s.start_line == target_line_number && s.function_name == function_name)
+                .map(|s| s.impl_type.clone())
+                .unwrap_or_default();
             for check in checks {
                 suppressions
                     .function_checks
-                    .insert((function_name.clone(), check));
+                    .insert((impl_type.clone(), function_name.clone(), check));
             }
         } else {
             let target_line_number = target_idx + 1;
@@ -111,13 +217,27 @@ fn parse_suppressions(source: &str) -> Suppressions {
     suppressions
 }
 
-fn is_suppressed(finding: &Finding, suppressions: &Suppressions) -> bool {
-    suppressions
+fn is_suppressed(finding: &Finding, suppressions: &Suppressions, fn_spans: &[FnSpan]) -> bool {
+    if suppressions
         .line_checks
         .contains(&(finding.line, finding.check_name.clone()))
-        || suppressions
-            .function_checks
-            .contains(&(finding.function_name.clone(), finding.check_name.clone()))
+    {
+        return true;
+    }
+    let impl_type = fn_spans
+        .iter()
+        .find(|s| {
+            s.function_name == finding.function_name
+                && s.start_line <= finding.line
+                && finding.line <= s.end_line
+        })
+        .map(|s| s.impl_type.clone())
+        .unwrap_or_default();
+    suppressions.function_checks.contains(&(
+        impl_type,
+        finding.function_name.clone(),
+        finding.check_name.clone(),
+    ))
 }
 
 fn dedup_findings(findings: &mut Vec<Finding>) {
@@ -125,19 +245,35 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
     findings.retain(|f| seen.insert((f.file_path.clone(), f.line, f.check_name.clone())));
 }
 
+/// Collect `.rs` paths under `root`, applying exclude/include glob filters and skipping
+/// files that carry a generated-file header. Returns `(paths, files_skipped)` where
+/// `files_skipped` is the count of files omitted due to the generated-file header.
 fn collect_rust_paths(
     root: &Path,
     excludes: &[String],
     includes: &[String],
 ) -> Result<(Vec<PathBuf>, usize), ScanError> {
-    let exclude_patterns: Vec<glob::Pattern> = excludes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-    let include_patterns: Vec<glob::Pattern> = includes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
+    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
+    for p in excludes {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => exclude_patterns.push(pattern),
+            Err(e) => return Err(ScanError::InvalidGlobPattern {
+                pattern: p.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+
+    let mut include_patterns: Vec<glob::Pattern> = Vec::new();
+    for p in includes {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => include_patterns.push(pattern),
+            Err(e) => return Err(ScanError::InvalidGlobPattern {
+                pattern: p.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
 
     if root.is_file() {
         return Ok((vec![root.to_path_buf()], 0));
@@ -204,7 +340,8 @@ fn run_checks_for_file(
             .to_string_lossy()
             .to_string()
     };
-    let suppressions = parse_suppressions(&content);
+    let fn_spans = build_fn_spans(&syn_file);
+    let suppressions = parse_suppressions(&content, &fn_spans);
 
     let mut findings: Vec<Finding> = checks
         .iter()
@@ -237,7 +374,7 @@ fn run_checks_for_file(
                 }
             }
         })
-        .filter(|finding| !is_suppressed(finding, &suppressions))
+        .filter(|finding| !is_suppressed(finding, &suppressions, &fn_spans))
         .collect();
 
     findings.sort_by_key(|f| f.line);
@@ -245,63 +382,27 @@ fn run_checks_for_file(
     Ok(findings)
 }
 
-/// `root` is used to compute relative file labels in findings. `excludes` are glob patterns
-/// matched against each explicit file path relative to `root`.
-/// Recursively scan `.rs` files under `root` and aggregate findings from every check.
-///
-/// `root` may be a directory **or a single `.rs` file**. When a file path is given it is scanned
-/// directly without any directory walk.
-///
-/// `root` is used only to compute relative file labels in findings (same convention as
-/// [`scan_directory`]). `excludes` are glob patterns matched against each file's path
-/// relative to `root`; matching files are skipped.
-pub fn scan_files(
-    paths: &[PathBuf],
-    root: &Path,
-    excludes: &[String],
-) -> Result<(Vec<Finding>, usize), ScanError> {
-    let root = root.canonicalize()?;
-    let exclude_patterns: Vec<glob::Pattern> = excludes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-    let checks = default_checks();
-
-    let filtered: Vec<PathBuf> = paths
-        .iter()
-        .filter(|path| {
-            let label = path.strip_prefix(&root).unwrap_or(path);
-            !exclude_patterns
-                .iter()
-                .any(|pat| pat.matches_path(label) || pat.matches_path(path))
-        })
-        .cloned()
-        .collect();
-
-    let files_scanned = filtered.len();
-
-    let mut findings: Vec<Finding> = filtered
-        .par_iter()
-        .map(|path| run_checks_for_file(path, &root, &checks))
-        .collect::<Result<Vec<Vec<Finding>>, ScanError>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-
-    findings.sort_by(|a, b| {
-        a.file_path
-            .cmp(&b.file_path)
-            .then_with(|| a.line.cmp(&b.line))
-    });
-    dedup_findings(&mut findings);
-    Ok((findings, files_scanned))
+/// Findings for a single source file.
+#[derive(Debug)]
+pub struct FileScanResult {
+    pub file_path: String,
+    pub findings: Vec<Finding>,
 }
 
 /// Recursively scan `.rs` files under `root` and aggregate findings from every default check.
 ///
-/// `root` may be a directory or a single `.rs` file. `excludes` and `includes` are glob patterns
-/// matched against paths relative to `root`. Generated Rust files with common generated-file
-/// headers are skipped.
+/// `root` may be a directory **or a single `.rs` file**. When a file path is given it is scanned
+/// directly without any directory walk.
+///
+/// `excludes` are glob patterns (e.g. `vendor/**`, `**/generated/*.rs`) matched against each
+/// file's path relative to `root`; matching files are skipped entirely.
+///
+/// `includes` are glob patterns; when non-empty only files matching at least one pattern are
+/// scanned. When `includes` is empty all `.rs` files (minus excludes and generated-file
+/// headers) are scanned.
+///
+/// Returns `(findings, files_scanned, files_skipped)` where `files_skipped` counts files
+/// omitted because they carry a generated-file header.
 pub fn scan_directory(
     root: &Path,
     excludes: &[String],
@@ -330,19 +431,84 @@ pub fn scan_directory(
 }
 
 /// Like [`scan_directory`] but runs `checks` instead of [`default_checks`].
+///
+/// Returns `(results, files_scanned, files_skipped)` where each element of `results` groups
+/// findings by source file, and `files_skipped` counts files omitted due to generated-file
+/// headers (see [`scan_directory`]).
 pub fn scan_directory_with_checks(
     root: &Path,
     excludes: &[String],
     includes: &[String],
     checks: &[Box<dyn Check + Send + Sync>],
-) -> Result<(Vec<Finding>, usize, usize), ScanError> {
+) -> Result<(Vec<FileScanResult>, usize, usize), ScanError> {
     let root = root.canonicalize()?;
     let (paths, files_skipped) = collect_rust_paths(&root, excludes, includes)?;
     let files_scanned = paths.len();
 
-    let mut findings: Vec<Finding> = paths
+    let mut results: Vec<FileScanResult> = paths
         .par_iter()
-        .map(|path| run_checks_for_file(path, &root, checks))
+        .map(|path| {
+            let findings = run_checks_for_file(path, &root, checks)?;
+            let file_label = if root.is_file() {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                path.strip_prefix(&root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string()
+            };
+            Ok(FileScanResult { file_path: file_label, findings })
+        })
+        .collect::<Result<Vec<_>, ScanError>>()?;
+
+    results.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+    Ok((results, files_scanned, files_skipped))
+}
+
+/// Scan an explicit list of `.rs` file paths and aggregate findings from every default check.
+///
+/// `root` is used only to compute relative file labels in findings (same convention as
+/// [`scan_directory`]). `excludes` are glob patterns matched against each file's path
+/// relative to `root`; matching files are skipped.
+///
+/// Returns `(findings, files_scanned)`.
+pub fn scan_files(
+    paths: &[PathBuf],
+    root: &Path,
+    excludes: &[String],
+) -> Result<(Vec<Finding>, usize), ScanError> {
+    let root = root.canonicalize()?;
+    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
+    for p in excludes {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => exclude_patterns.push(pattern),
+            Err(e) => return Err(ScanError::InvalidGlobPattern {
+                pattern: p.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+
+    let filtered: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|path| {
+            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
+            !exclude_patterns
+                .iter()
+                .any(|pat| pat.matches_path(label) || pat.matches_path(&path_canon))
+        })
+        .collect();
+
+    let files_scanned = filtered.len();
+    let checks = default_checks();
+
+    let mut findings: Vec<Finding> = filtered
+        .par_iter()
+        .map(|path| run_checks_for_file(path, &root, &checks))
         .collect::<Result<Vec<Vec<Finding>>, ScanError>>()?
         .into_iter()
         .flatten()
@@ -353,6 +519,300 @@ pub fn scan_directory_with_checks(
             .cmp(&b.file_path)
             .then_with(|| a.line.cmp(&b.line))
     });
-    dedup_findings(&mut findings);
-    Ok((findings, files_scanned, files_skipped))
+
+    Ok((findings, files_scanned))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn scan_single_rs_file_directly() {
+        let dir = std::env::temp_dir().join(format!(
+            "soroban-guard-singlefile-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("lib.rs");
+        fs::write(&file_path, "pub fn f() {}").unwrap();
+
+        let (_, files_scanned, files_skipped) = scan_directory(&file_path, &[], &[]).unwrap();
+        assert_eq!(files_scanned, 1);
+        assert_eq!(files_skipped, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scan_error_check_panic_format() {
+        let err = ScanError::CheckPanic {
+            check: "example-check".to_string(),
+            path: PathBuf::from("src/lib.rs"),
+            message: "unexpected AST shape".to_string(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "Check `example-check` panicked on src/lib.rs: unexpected AST shape"
+        );
+    }
+
+    #[test]
+    fn reports_scanned_rust_file_count_after_filters() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-analyzer-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn included() {}").unwrap();
+        fs::write(root.join("src/excluded.rs"), "pub fn excluded() {}").unwrap();
+        fs::write(root.join("target/generated.rs"), "pub fn generated() {}").unwrap();
+        fs::write(root.join("README.md"), "not Rust").unwrap();
+
+        let (_, files_scanned, files_skipped) =
+            scan_directory(&root, &["src/excluded.rs".to_string()], &[]).unwrap();
+
+        assert_eq!(files_scanned, 1);
+        assert_eq!(files_skipped, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn include_filter_limits_scanned_files() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-include-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn a() {}").unwrap();
+        fs::write(root.join("src/other.rs"), "pub fn b() {}").unwrap();
+
+        let (_, files_scanned, files_skipped) =
+            scan_directory(&root, &[], &["src/lib.rs".to_string()]).unwrap();
+
+        assert_eq!(files_scanned, 1);
+        assert_eq!(files_skipped, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn skips_generated_files_with_header() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-generated-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "// @generated\npub fn generated() {}\n",
+        )
+        .unwrap();
+
+        let (_, files_scanned, files_skipped) = scan_directory(&root, &[], &[]).unwrap();
+
+        assert_eq!(files_scanned, 0);
+        assert_eq!(files_skipped, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_files_returns_findings_for_explicit_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-scan-files-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let included = root.join("src/lib.rs");
+        let excluded = root.join("src/other.rs");
+        fs::write(&included, "pub fn a() {}").unwrap();
+        fs::write(&excluded, "pub fn b() {}").unwrap();
+
+        let (_, files_scanned) = scan_files(&[included, excluded.clone()], &root, &[]).unwrap();
+        assert_eq!(files_scanned, 2);
+
+        // Exclude one file via glob
+        let (_, files_scanned) =
+            scan_files(&[excluded], &root, &["src/other.rs".to_string()]).unwrap();
+        assert_eq!(files_scanned, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_directory_rejects_invalid_exclude_glob() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-invalid-glob-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let result = scan_directory(&root, &["src/[foo.rs".to_string()], &[]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid glob pattern") || err_msg.contains("src/[foo.rs"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_directory_rejects_invalid_include_glob() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-invalid-include-glob-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let result = scan_directory(&root, &[], &["src/[invalid.rs".to_string()]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid glob pattern") || err_msg.contains("src/[invalid.rs"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    use soroban_guard_checks::{Finding, Severity};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A check that always returns two identical findings for every file it sees.
+    struct DuplicatingCheck;
+    impl soroban_guard_checks::Check for DuplicatingCheck {
+        fn name(&self) -> &str { "dup-check" }
+        fn run(&self, _file: &syn::File, _src: &str) -> Vec<Finding> {
+            let f = Finding {
+                check_name: "dup-check".into(),
+                severity: Severity::Low,
+                file_path: String::new(),
+                line: 1,
+                function_name: "f".into(),
+                description: "duplicate".into(),
+                rule_url: None,
+                suggestion: None,
+            };
+            vec![f.clone(), f]
+        }
+    }
+
+    #[test]
+    fn deduplicates_findings_with_same_file_line_check() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-dedup-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let checks: Vec<Box<dyn soroban_guard_checks::Check + Send + Sync>> =
+            vec![Box::new(DuplicatingCheck)];
+        let (results, _, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
+
+        let total: usize = results.iter().map(|r| r.findings.len()).sum();
+        assert_eq!(total, 1, "expected 1 finding after dedup, got {}", total);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A check that returns two findings at different lines, intentionally reversed.
+    struct ReversedCheck;
+    impl soroban_guard_checks::Check for ReversedCheck {
+        fn name(&self) -> &str { "reversed-check" }
+        fn run(&self, _file: &syn::File, _src: &str) -> Vec<Finding> {
+            vec![
+                Finding {
+                    check_name: "reversed-check".into(),
+                    severity: Severity::Low,
+                    file_path: String::new(),
+                    line: 20,
+                    function_name: "b".into(),
+                    description: "second".into(),
+                    rule_url: None,
+                    suggestion: None,
+                },
+                Finding {
+                    check_name: "reversed-check".into(),
+                    severity: Severity::Low,
+                    file_path: String::new(),
+                    line: 5,
+                    function_name: "a".into(),
+                    description: "first".into(),
+                    rule_url: None,
+                    suggestion: None,
+                },
+            ]
+        }
+    }
+
+    #[test]
+    fn findings_sorted_by_file_path_then_line() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-sort-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        // Two files — rayon may process them in any order.
+        fs::write(root.join("src/b_module.rs"), "pub fn b() {}").unwrap();
+        fs::write(root.join("src/a_module.rs"), "pub fn a() {}").unwrap();
+
+        let checks: Vec<Box<dyn soroban_guard_checks::Check + Send + Sync>> =
+            vec![Box::new(ReversedCheck)];
+        let (results, _, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
+
+        // Files must be in lexicographic order.
+        let file_paths: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
+        assert!(
+            file_paths.windows(2).all(|w| w[0] <= w[1]),
+            "files not in sorted order: {:?}",
+            file_paths
+        );
+
+        // Within each file, findings must be sorted by line.
+        for r in &results {
+            let lines: Vec<usize> = r.findings.iter().map(|f| f.line).collect();
+            assert!(
+                lines.windows(2).all(|w| w[0] <= w[1]),
+                "findings in {} not sorted by line: {:?}",
+                r.file_path,
+                lines
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

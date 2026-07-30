@@ -1,4 +1,5 @@
 use crate::{Check, Finding, Severity};
+use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Expr, ImplItem, ItemImpl};
 
@@ -31,7 +32,7 @@ impl<'ast> Visit<'ast> for LoopVisitor {
 
         for item in &node.items {
             if let ImplItem::Fn(method) = item {
-                if self.in_contractimpl && method.sig.vis.is_pub() {
+                if self.in_contractimpl && matches!(method.vis, syn::Visibility::Public(_)) {
                     let mut loop_visitor = LoopFinder::default();
                     visit::visit_block(&mut loop_visitor, &method.block);
 
@@ -88,6 +89,9 @@ impl<'ast> Visit<'ast> for LoopFinder {
             }
             Expr::While(_) => {
                 self.loops.push((node.span().start().line, "while".to_string()));
+            }
+            Expr::ForLoop(_) => {
+                self.loops.push((node.span().start().line, "for".to_string()));
             }
             _ => {}
         }

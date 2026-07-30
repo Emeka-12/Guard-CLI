@@ -102,6 +102,11 @@ fn zero_address_fixtures() {
     assert_fixture_pair("zero-address", "missing-zero-address-check");
 }
 
+#[test]
+fn uninitialized_storage_read_fixtures() {
+    assert_fixture_pair("uninitialized-storage-read", "uninitialized-storage-read");
+}
+
 /// Verify that `soroban-guard.toml` is read and its `[checks.sensitive_names].extra` list
 /// extends the built-in admin check so that custom function names are flagged.
 #[test]
@@ -147,7 +152,7 @@ extra = ["drain"]
 
     // Without config: `drain` should NOT be flagged.
     let checks_no_cfg = default_checks_with_config(&[], &[]);
-    let (results_no_cfg, _) =
+    let (results_no_cfg, _, _) =
         scan_directory_with_checks(&root, &[], &[], &checks_no_cfg).unwrap();
     let findings_no_cfg: Vec<_> = results_no_cfg
         .iter()
@@ -161,7 +166,7 @@ extra = ["drain"]
 
     // With config extra name: `drain` SHOULD be flagged.
     let checks_with_cfg = default_checks_with_config(&[], &["drain".to_string()]);
-    let (results_with_cfg, _) =
+    let (results_with_cfg, _, _) =
         scan_directory_with_checks(&root, &[], &[], &checks_with_cfg).unwrap();
     let findings_with_cfg: Vec<_> = results_with_cfg
         .iter()
@@ -171,6 +176,69 @@ extra = ["drain"]
     assert!(
         !findings_with_cfg.is_empty(),
         "`drain` should be flagged when listed in config extra sensitive_names"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Verify that `soroban-guard.toml` `[scan] path` is used when no CLI path is provided
+#[test]
+fn config_scan_path_as_fallback() {
+    use soroban_guard_analyzer::scan_directory;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let root = std::env::temp_dir().join(format!(
+        "soroban-guard-cfg-path-test-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Write a simple contract with an admin check issue
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use soroban_sdk::{contractimpl, Env};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn set_owner(env: Env) {
+        let _ = env;
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Config file that specifies the scan path
+    fs::write(
+        root.join("soroban-guard.toml"),
+        r#"
+[scan]
+path = "src"
+"#,
+    )
+    .unwrap();
+
+    // Scan using the path from config (via current directory config)
+    let config_root = match config::load(&root) {
+        Ok(Some(cfg)) => {
+            if let Some(path_str) = cfg.scan.path {
+                root.join(&path_str)
+            } else {
+                panic!("Config should have path set");
+            }
+        }
+        _ => panic!("Should load config with path"),
+    };
+
+    let (findings, _, _) = scan_directory(&config_root, &[], &[]).unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.check_name == "unprotected-admin"),
+        "Should find unprotected-admin check using path from config"
     );
 
     fs::remove_dir_all(root).unwrap();

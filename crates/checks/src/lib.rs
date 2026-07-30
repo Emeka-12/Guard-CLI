@@ -13,6 +13,8 @@ pub mod hardcoded_address;
 pub mod invoke_return;
 pub mod key_collision;
 pub mod large_loop;
+pub mod missing_event_for_admin_change;
+pub mod missing_input_length_bound;
 pub mod missing_nonce;
 pub mod overflow;
 pub mod panics;
@@ -32,7 +34,7 @@ pub mod uninitialized_storage_read;
 pub mod unprotected_contract_deployment;
 pub mod unprotected_token_mint;
 pub mod unprotected_upgrade;
-mod util;
+pub mod util;
 
 pub use admin::UnprotectedAdminCheck;
 pub use annotations::MissingContractAnnotationCheck;
@@ -47,6 +49,8 @@ pub use hardcoded_address::HardcodedAddressCheck;
 pub use invoke_return::UncheckedInvokeReturnCheck;
 pub use key_collision::SymbolKeyCollisionCheck;
 pub use large_loop::LargeLoopCheck;
+pub use missing_event_for_admin_change::MissingEventForAdminChangeCheck;
+pub use missing_input_length_bound::MissingInputLengthBoundCheck;
 pub use missing_nonce::MissingNonceCheck;
 pub use overflow::UncheckedArithmeticCheck;
 pub use panics::PanicInContractCheck;
@@ -184,21 +188,15 @@ pub fn group_by_severity<'a>(findings: &'a [Finding]) -> BTreeMap<Severity, Vec<
     map
 }
 
-/// All checks executed by the analyzer (extend here as you add detectors).
+/// Base list of all built-in checks, using the plain (no-config) constructor for every check.
 ///
-/// Checks are **stateless and isolated**: implementations must not use shared
-/// mutable static state or assume a particular invocation order. The analyzer
-/// runs each check against the same parsed `syn::File` independently and
-/// concatenates `Finding`s.
-///
-/// # Panics
-///
-/// Panics immediately if any two checks share the same [`Check::name`] string.
-/// This catches copy-paste errors when adding a new detector before they can
-/// cause silent finding collisions at runtime.
-pub fn default_checks() -> Vec<Box<dyn Check + Send + Sync>> {
+/// This is the single source of truth for the check list. Both [`default_checks`] and
+/// [`default_checks_with_config`] derive their lists from this function so that adding or
+/// removing a check only requires editing one place.
+fn all_checks_base() -> Vec<Box<dyn Check + Send + Sync>> {
     vec![
         Box::new(MissingRequireAuthCheck),
+        Box::new(AuthAfterStorageWriteCheck),
         Box::new(UncheckedArithmeticCheck),
         Box::new(UnprotectedAdminCheck::new()),
         Box::new(UnsafeStoragePatternsCheck),
@@ -220,11 +218,35 @@ pub fn default_checks() -> Vec<Box<dyn Check + Send + Sync>> {
         Box::new(UnboundedVecGrowthCheck),
         Box::new(UnsafeRandomnessCheck),
         Box::new(UncheckedDivisorCheck),
+        Box::new(PanicInContractCheck),
         Box::new(UnprotectedUpgradeCheck),
         Box::new(UnprotectedTokenMintCheck),
         Box::new(UnprotectedContractDeploymentCheck),
         Box::new(UncheckedTokenAmountCheck),
+        Box::new(LargeLoopCheck),
+        Box::new(MissingNonceCheck),
+        Box::new(UninitializedStorageReadCheck),
+        Box::new(ReentrancyRiskCheck),
+        Box::new(AuthAfterStorageWriteCheck),
+        Box::new(MissingEventForAdminChangeCheck),
+        Box::new(MissingInputLengthBoundCheck),
     ]
+}
+
+/// All checks executed by the analyzer (extend here as you add detectors).
+///
+/// Checks are **stateless and isolated**: implementations must not use shared
+/// mutable static state or assume a particular invocation order. The analyzer
+/// runs each check against the same parsed `syn::File` independently and
+/// concatenates `Finding`s.
+///
+/// # Panics
+///
+/// Panics immediately if any two checks share the same [`Check::name`] string.
+/// This catches copy-paste errors when adding a new detector before they can
+/// cause silent finding collisions at runtime.
+pub fn default_checks() -> Vec<Box<dyn Check + Send + Sync>> {
+    all_checks_base()
 }
 
 /// Like [`default_checks`] but applies config-file settings:
@@ -236,6 +258,7 @@ pub fn default_checks_with_config(
 ) -> Vec<Box<dyn Check + Send + Sync>> {
     let mut checks: Vec<Box<dyn Check + Send + Sync>> = vec![
         Box::new(MissingRequireAuthCheck),
+        Box::new(AuthAfterStorageWriteCheck),
         Box::new(UncheckedArithmeticCheck),
         Box::new(UnprotectedAdminCheck::with_extra_names(extra_sensitive_names.to_vec())),
         Box::new(UnsafeStoragePatternsCheck),
@@ -257,10 +280,18 @@ pub fn default_checks_with_config(
         Box::new(UnboundedVecGrowthCheck),
         Box::new(UnsafeRandomnessCheck),
         Box::new(UncheckedDivisorCheck),
+        Box::new(PanicInContractCheck),
         Box::new(UnprotectedUpgradeCheck),
         Box::new(UnprotectedTokenMintCheck),
         Box::new(UnprotectedContractDeploymentCheck),
         Box::new(UncheckedTokenAmountCheck),
+        Box::new(LargeLoopCheck),
+        Box::new(MissingNonceCheck),
+        Box::new(UninitializedStorageReadCheck),
+        Box::new(ReentrancyRiskCheck),
+        Box::new(AuthAfterStorageWriteCheck),
+        Box::new(MissingEventForAdminChangeCheck),
+        Box::new(MissingInputLengthBoundCheck),
     ];
     checks.retain(|c| !disabled.contains(&c.name().to_string()));
     checks

@@ -2,9 +2,8 @@
 //! back without any length cap, which can brick the contract once the ledger entry size
 //! limit is exceeded.
 
-use crate::util::contractimpl_functions;
+use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
 use crate::{Check, Finding, Severity};
-use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Expr, ExprMethodCall, File};
 
@@ -19,7 +18,7 @@ impl Check for UnboundedVecGrowthCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             let mut scan = BodyScan::default();
             scan.visit_block(&method.block);
@@ -55,19 +54,6 @@ impl Check for UnboundedVecGrowthCheck {
             }
         }
         out
-    }
-}
-
-fn receiver_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "storage" {
-                return true;
-            }
-            receiver_chain_contains_storage(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_storage(&f.base),
-        _ => false,
     }
 }
 

@@ -1,6 +1,8 @@
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
+use syn::spanned::Spanned;
 use syn::{ImplItem, ItemImpl};
+
 
 const CHECK_NAME: &str = "missing-event-for-admin-change";
 const ADMIN_NAMES: &[&str] = &["set_owner", "set_admin", "transfer_ownership", "set_operator"];
@@ -30,7 +32,7 @@ impl<'ast> Visit<'ast> for AdminEventVisitor {
             for item in &node.items {
                 if let ImplItem::Fn(method) = item {
                     let name = method.sig.ident.to_string();
-                    if is_admin_name(&name) && method.sig.vis.is_pub() {
+                    if is_admin_name(&name) && matches!(method.vis, syn::Visibility::Public(_)) {
                         let has_storage_write = has_storage_write(&method.block);
                         let has_event = has_event_emit(&method.block);
 

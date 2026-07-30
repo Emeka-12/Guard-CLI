@@ -1,4 +1,4 @@
-//! Hardcoded Stellar public-key strings (`G...`, 56 chars) baked into contract source.
+//! Hardcoded Stellar address strings (`G...` or `C...`, 56 chars) baked into contract source.
 
 use crate::{Check, Finding, Severity};
 use syn::File;
@@ -6,9 +6,10 @@ use syn::File;
 const CHECK_NAME: &str = "hardcoded-address";
 const KEY_LEN: usize = 56;
 
-/// Stellar `StrKey` public keys are 56-char base32 strings starting with `G`. Hardcoding one
-/// bakes a fixed address into the contract, which breaks if the account or contract is
-/// redeployed. Works on the raw source text rather than the parsed AST.
+/// Stellar `StrKey` addresses are 56-char base32 strings starting with `G` (Ed25519 public keys)
+/// or `C` (Soroban contract addresses). Hardcoding one bakes a fixed address into the contract,
+/// which breaks if the account or contract is redeployed. Works on the raw source text rather
+/// than the parsed AST.
 pub struct HardcodedAddressCheck;
 
 impl Check for HardcodedAddressCheck {
@@ -50,13 +51,13 @@ fn is_strkey_char(b: u8) -> bool {
     b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)
 }
 
-/// Finds `G`-prefixed, 56-char base32 runs on a line that aren't part of a larger identifier.
+/// Finds `G`- or `C`-prefixed, 56-char base32 runs on a line that aren't part of a larger identifier.
 fn find_candidate_keys(line: &str) -> Vec<&str> {
     let bytes = line.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'G' {
+        if bytes[i] == b'G' || bytes[i] == b'C' {
             let boundary_before =
                 i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             let end = i + KEY_LEN;
@@ -108,6 +109,31 @@ impl C {{
     }
 
     #[test]
+    fn flags_hardcoded_soroban_contract_address() -> Result<(), syn::Error> {
+        let key = format!("C{}", "A".repeat(55));
+        let source = format!(
+            r#"
+use soroban_sdk::{{contractimpl, Address, Env}};
+
+pub struct C;
+
+#[contractimpl]
+impl C {{
+    pub fn invoke(env: Env) {{
+        let token_contract = Address::from_str(&env, "{key}");
+        let _ = token_contract;
+    }}
+}}
+"#
+        );
+        let file = parse_file(&source)?;
+        let hits = HardcodedAddressCheck.run(&file, &source);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Medium);
+        Ok(())
+    }
+
+    #[test]
     fn ignores_short_strings() -> Result<(), syn::Error> {
         let source = r#"
 use soroban_sdk::{contractimpl, Env};
@@ -119,6 +145,7 @@ impl C {
     pub fn hello(env: Env) {
         let _ = env;
         let _ = "GSHORT";
+        let _ = "CSHORT";
     }
 }
 "#;
