@@ -12,7 +12,7 @@ This document describes what each Soroban Guard Core check looks for and why it 
 
 In an `impl` block marked with `#[contractimpl]` or `#[soroban_sdk::contractimpl]`, any function whose body:
 
-1. Performs a storage mutation through `env.storage()` (heuristic: method calls `set`, `remove`, `extend_ttl`, `bump`, or `append` on a receiver chain that includes `.storage()`), and  
+1. Performs a storage mutation through `env.storage()` (heuristic: method s `set`, `remove`, `extend_ttl`, `bump`, or `append` on a receiver chain that includes `.storage()`), and  
 2. Never calls `env.require_auth()` (parameter name **`env`**: `env.require_auth()`).
 
 **Why it matters**
