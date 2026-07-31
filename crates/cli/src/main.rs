@@ -38,7 +38,7 @@ enum Commands {
         /// Print findings as a Markdown table
         #[arg(long)]
         markdown: bool,
-        /// Write output to a file instead of stdout (applies to --json and --sarif)
+        /// Write output to a file instead of stdout (applies to --json, --sarif, and --markdown)
         #[arg(long)]
         output: Option<PathBuf>,
         /// Suppress all output when there are zero High findings
@@ -151,7 +151,15 @@ fn run_scan(
                 }
             } else if opts.markdown {
                 if !opts.quiet || should_fail {
-                    print_markdown(&findings);
+                    let payload = render_markdown(&findings);
+                    if let Some(ref out_path) = opts.output {
+                        if let Err(e) = write_output(out_path, &payload) {
+                            eprintln!("{} {}", "error:".red().bold(), e);
+                            return 2;
+                        }
+                    } else {
+                        print!("{payload}");
+                    }
                 }
             } else if !opts.quiet || should_fail {
                 let (display, truncated) = truncate(&findings, 0);
@@ -344,57 +352,6 @@ fn main() {
             let extra_sensitive = &cfg.checks.sensitive_names.extra;
             let active_checks = default_checks_with_config(&all_disabled, extra_sensitive);
 
-            let includes: Vec<String> = include;
-            match scan_directory_with_checks(&scan_path, &exclude, &includes, &active_checks) {
-                Ok((results, files_scanned, files_skipped)) => {
-                    let findings: Vec<Finding> =
-                        results.into_iter().flat_map(|r| r.findings).collect();
-                    let should_fail = findings
-                        .iter()
-                        .any(|f| f.severity <= fail_threshold);
-
-                    if json {
-                        if !quiet || should_fail {
-                            match json_payload(&findings, files_scanned) {
-                                Ok(payload) => {
-                                    if let Some(ref out_path) = output {
-                                        if let Err(e) = write_output(out_path, &payload) {
-                                            eprintln!("{} {}", "error:".red().bold(), e);
-                                            std::process::exit(2);
-                                        }
-                                    } else {
-                                        println!("{payload}");
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("{} {}", "error:".red().bold(), e);
-                                    std::process::exit(2);
-                                }
-                            }
-                        }
-                    } else if sarif {
-                        if !quiet || should_fail {
-                            let payload =
-                                serde_json::to_string_pretty(&build_sarif(&findings)).unwrap();
-                            if let Some(ref out_path) = output {
-                                if let Err(e) = write_output(out_path, &payload) {
-                                    eprintln!("{} {}", "error:".red().bold(), e);
-                                    std::process::exit(2);
-                                }
-                            } else {
-                                println!("{payload}");
-                            }
-                        }
-                    } else if markdown {
-                        if !quiet || should_fail {
-                            print_markdown(&findings);
-                        }
-                    } else if !quiet || should_fail {
-                        let (display, truncated) = truncate(&findings, 0);
-                        print_pretty(display, files_scanned, scan_path.display().to_string(), truncated);
-                    }
-
-            let includes = include.clone();
             // Build a ScanOptions struct to pass around cleanly.
             let opts = ScanOptions {
                 path: scan_path.clone(),
@@ -406,7 +363,7 @@ fn main() {
                 verbose,
                 fail_threshold,
                 exclude: exclude.clone(),
-                includes,
+                includes: include.clone(),
             };
 
             // Run the initial scan.
@@ -440,7 +397,7 @@ fn main() {
                     });
 
                 watcher
-                    .watch(&path, RecursiveMode::Recursive)
+                    .watch(&scan_path, RecursiveMode::Recursive)
                     .unwrap_or_else(|e| {
                         eprintln!("{} failed to watch path: {}", "error:".red().bold(), e);
                         std::process::exit(2);
@@ -519,40 +476,6 @@ fn main() {
     }
 }
 
-
-#[contractimpl]
-impl VulnerableContract {
-    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
-    pub fn bump(env: Env) {
-        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
-        n += 1;
-        env.storage().instance().set(&KEY, &n);
-    }
-}
-
-
-#[contractimpl]
-impl VulnerableContract {
-    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
-    pub fn bump(env: Env) {
-        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
-        n += 1;
-        env.storage().instance().set(&KEY, &n);
-    }
-}
-
-
-
-
-#[contractimpl]
-impl VulnerableContract {
-    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
-    pub fn bump(env: Env) {
-        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
-        n += 1;
-        env.storage().instance().set(&KEY, &n);
-    }
-}
 
 /// Returns (slice to display, count of truncated findings).
 fn truncate(findings: &[Finding], max: usize) -> (&[Finding], usize) {
@@ -802,29 +725,30 @@ fn json_payload(findings: &[Finding], files_scanned: usize) -> Result<String, se
     serde_json::to_string_pretty(&envelope)
 }
 
-fn print_markdown(findings: &[Finding]) {
-    println!("## Soroban Guard Findings\n");
+fn render_markdown(findings: &[Finding]) -> String {
+    let mut out = String::new();
+    out.push_str("## Soroban Guard Findings\n\n");
     if findings.is_empty() {
-        println!("No issues found.");
-        return;
+        out.push_str("No issues found.\n");
+        return out;
     }
-    println!("| # | Severity | File | Line | Check | Function |");
-    println!("|---|----------|------|------|-------|----------|");
+    out.push_str("| # | Severity | File | Line | Check | Function |\n");
+    out.push_str("|---|----------|------|------|-------|----------|\n");
     for (i, f) in findings.iter().enumerate() {
         let sev = match f.severity {
-            Severity::High => "**HIGH**".to_string(),
-            Severity::Medium => "MEDIUM".to_string(),
-            Severity::Low => "LOW".to_string(),
+            Severity::High => "**HIGH**",
+            Severity::Medium => "MEDIUM",
+            Severity::Low => "LOW",
         };
-        println!(
-            "| {} | {} | {} | {} | {} | {} |",
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
             i + 1,
             sev,
             f.file_path,
             f.line,
             f.check_name,
             f.function_name
-        );
+        ));
     }
     let high = findings
         .iter()
@@ -838,13 +762,14 @@ fn print_markdown(findings: &[Finding]) {
         .iter()
         .filter(|f| matches!(f.severity, Severity::Low))
         .count();
-    println!(
-        "\n**{} finding(s): {} High, {} Medium, {} Low**",
+    out.push_str(&format!(
+        "\n**{} finding(s): {} High, {} Medium, {} Low**\n",
         findings.len(),
         high,
         medium,
         low
-    );
+    ));
+    out
 }
 
 fn summary_text(findings: &[Finding], files_scanned: usize) -> String {
@@ -1094,6 +1019,75 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(parsed["version"], "2.1.0");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn markdown_written_to_file_when_output_provided() {
+        let findings = vec![
+            Finding {
+                check_name: "missing-require-auth".to_string(),
+                severity: Severity::High,
+                file_path: "src/lib.rs".to_string(),
+                line: 10,
+                function_name: "set_balance".to_string(),
+                description: "Missing require_auth".to_string(),
+                rule_url: None,
+                suggestion: None,
+            },
+            Finding {
+                check_name: "unchecked-arithmetic".to_string(),
+                severity: Severity::Medium,
+                file_path: "src/lib.rs".to_string(),
+                line: 20,
+                function_name: "update".to_string(),
+                description: "Unchecked arithmetic".to_string(),
+                rule_url: None,
+                suggestion: None,
+            },
+        ];
+
+        let path = std::env::temp_dir().join(format!(
+            "soroban-guard-markdown-{}-{}.md",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // render_markdown produces the correct Markdown table
+        let payload = render_markdown(&findings);
+
+        // Write to file via write_output (the same helper used by --json and --sarif)
+        write_output(&path, &payload).unwrap();
+
+        assert!(path.exists(), "output file should have been created");
+
+        let contents = fs::read_to_string(&path).unwrap();
+
+        // Structural checks on the rendered Markdown
+        assert!(
+            contents.contains("## Soroban Guard Findings"),
+            "should contain the heading"
+        );
+        assert!(
+            contents.contains("**HIGH**"),
+            "High severity should be bold in Markdown"
+        );
+        assert!(
+            contents.contains("missing-require-auth"),
+            "should contain the check name"
+        );
+        assert!(
+            contents.contains("unchecked-arithmetic"),
+            "should contain the second check name"
+        );
+        assert!(
+            contents.contains("2 finding(s): 1 High, 1 Medium, 0 Low"),
+            "should contain the summary line"
+        );
+
         let _ = fs::remove_file(path);
     }
 
