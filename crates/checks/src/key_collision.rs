@@ -18,34 +18,34 @@ impl Check for SymbolKeyCollisionCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut findings = Vec::new();
+        let mut symbol_keys = std::collections::HashMap::new();
+        let mut visitor = SymbolKeyVisitor {
+            symbol_keys: &mut symbol_keys,
+            current_function: String::new(),
+        };
+        visitor.visit_file(file);
 
-        for item in &file.items {
-            if let syn::Item::Impl(impl_block) = item {
-                let mut symbol_keys = std::collections::HashMap::new();
-                let mut visitor = SymbolKeyVisitor {
-                    symbol_keys: &mut symbol_keys,
-                    current_function: String::new(),
-                };
-                visitor.visit_item_impl(impl_block);
-
-                for (key, positions) in symbol_keys {
-                    if positions.len() > 1 {
-                        for (pos, line, fn_name) in positions.iter().skip(1) {
-                            findings.push(Finding {
-                                check_name: CHECK_NAME.to_string(),
-                                severity: Severity::Medium,
-                                file_path: String::new(),
-                                line: *line,
-                                function_name: fn_name.clone(),
-                                description: format!(
-                                    "Duplicate symbol key `{}` found at position {}",
-                                    key, pos
-                                ),
-                                rule_url: None,
-                                suggestion: None,
-                            });
-                        }
-                    }
+        for (key, positions) in symbol_keys {
+            if positions.len() > 1 {
+                for (pos, line, fn_name) in positions.iter().skip(1) {
+                    let loc = if fn_name.is_empty() {
+                        "module level".to_string()
+                    } else {
+                        fn_name.clone()
+                    };
+                    findings.push(Finding {
+                        check_name: CHECK_NAME.to_string(),
+                        severity: Severity::Medium,
+                        file_path: String::new(),
+                        line: *line,
+                        function_name: loc,
+                        description: format!(
+                            "Duplicate symbol key `{}` found at position {}",
+                            key, pos
+                        ),
+                        rule_url: None,
+                        suggestion: None,
+                    });
                 }
             }
         }
@@ -66,6 +66,12 @@ impl<'ast, 'a> Visit<'ast> for SymbolKeyVisitor<'a> {
         self.current_function = prev;
     }
 
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        let prev = std::mem::replace(&mut self.current_function, format!("const {}", node.ident));
+        visit::visit_item_const(self, node);
+        self.current_function = prev;
+    }
+
     fn visit_macro(&mut self, m: &'ast Macro) {
         if let Some(last_segment) = m.path.segments.last() {
             if last_segment.ident == "symbol_short" {
@@ -83,6 +89,29 @@ impl<'ast, 'a> Visit<'ast> for SymbolKeyVisitor<'a> {
             }
         }
         visit::visit_macro(self, m);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(p) = &*node.func {
+            let segments: Vec<_> = p.path.segments.iter().collect();
+            if segments.len() >= 2 {
+                let last = segments[segments.len() - 1].ident.to_string();
+                let prev = segments[segments.len() - 2].ident.to_string();
+                if last == "new" && prev == "Symbol" {
+                    if let Some(syn::Expr::Lit(expr_lit)) = node.args.iter().nth(1) {
+                        if let Lit::Str(s) = &expr_lit.lit {
+                            let key = s.value();
+                            let span = node.span().start();
+                            self.symbol_keys
+                                .entry(key)
+                                .or_default()
+                                .push((span.column, span.line, self.current_function.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        visit::visit_expr_call(self, node);
     }
 }
 
@@ -131,5 +160,20 @@ impl Contract {
         let file = parse_file(src).unwrap();
         let findings = SymbolKeyCollisionCheck.run(&file, src);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn detects_module_level_const_collisions() {
+        let src = r#"
+use soroban_sdk::{symbol_short, Symbol, Env};
+
+const BALANCE_KEY: Symbol = symbol_short!("bal");
+const OLD_ADMIN_KEY: Symbol = Symbol::new(&env, "bal");
+"#;
+        let file = parse_file(src).unwrap();
+        let findings = SymbolKeyCollisionCheck.run(&file, src);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Medium);
+        assert_eq!(findings[0].function_name, "const OLD_ADMIN_KEY");
     }
 }
