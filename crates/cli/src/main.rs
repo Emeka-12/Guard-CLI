@@ -111,28 +111,28 @@ fn run_scan(
                 .iter()
                 .any(|f| f.severity <= opts.fail_threshold);
 
-            if opts.json {
-                if !opts.quiet || should_fail {
-                    match json_payload(&findings, files_scanned) {
-                        Ok(payload) => {
-                            if let Some(ref out_path) = opts.output {
-                                if let Err(e) = write_output(out_path, &payload) {
-                                    eprintln!("{} {}", "error:".red().bold(), e);
-                                    return 2;
-                                }
-                            } else {
-                                println!("{payload}");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("{} {}", "error:".red().bold(), e);
-                            return 2;
-                        }
-                    }
-                }
+            // Produce the serialized payload for the selected structured format,
+            // then emit it via a single shared write-or-print path (Issue #430).
+            // All three formats use println! (trailing newline) as the convention.
+            let structured_payload: Option<Result<String, String>> = if opts.json {
+                Some(
+                    json_payload(&findings, files_scanned, files_skipped)
+                        .map_err(|e| e.to_string()),
+                )
             } else if opts.sarif {
+                Some(
+                    serde_json::to_string_pretty(&build_sarif(&findings, files_skipped))
+                        .map_err(|e| e.to_string()),
+                )
+            } else if opts.markdown {
+                Some(Ok(render_markdown(&findings)))
+            } else {
+                None
+            };
+
+            if let Some(result) = structured_payload {
                 if !opts.quiet || should_fail {
-                    match serde_json::to_string_pretty(&build_sarif(&findings)) {
+                    match result {
                         Ok(payload) => {
                             if let Some(ref out_path) = opts.output {
                                 if let Err(e) = write_output(out_path, &payload) {
@@ -147,18 +147,6 @@ fn run_scan(
                             eprintln!("{} {}", "error:".red().bold(), e);
                             return 2;
                         }
-                    }
-                }
-            } else if opts.markdown {
-                if !opts.quiet || should_fail {
-                    let payload = render_markdown(&findings);
-                    if let Some(ref out_path) = opts.output {
-                        if let Err(e) = write_output(out_path, &payload) {
-                            eprintln!("{} {}", "error:".red().bold(), e);
-                            return 2;
-                        }
-                    } else {
-                        print!("{payload}");
                     }
                 }
             } else if !opts.quiet || should_fail {
@@ -486,7 +474,7 @@ fn truncate(findings: &[Finding], max: usize) -> (&[Finding], usize) {
     }
 }
 
-fn build_sarif(findings: &[Finding]) -> serde_json::Value {
+fn build_sarif(findings: &[Finding], files_skipped: usize) -> serde_json::Value {
     let mut rules = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for finding in findings {
@@ -528,6 +516,12 @@ fn build_sarif(findings: &[Finding]) -> serde_json::Value {
                     "rules": rules
                 }
             },
+            "invocations": [{
+                "executionSuccessful": true,
+                "properties": {
+                    "files_skipped": files_skipped
+                }
+            }],
             "results": results
         }]
     })
@@ -697,7 +691,7 @@ fn write_output(path: &Path, payload: &str) -> Result<(), std::io::Error> {
     fs::write(path, payload)
 }
 
-fn json_payload(findings: &[Finding], files_scanned: usize) -> Result<String, serde_json::Error> {
+fn json_payload(findings: &[Finding], files_scanned: usize, files_skipped: usize) -> Result<String, serde_json::Error> {
     let high = findings
         .iter()
         .filter(|f| matches!(f.severity, Severity::High))
@@ -717,7 +711,8 @@ fn json_payload(findings: &[Finding], files_scanned: usize) -> Result<String, se
             "high": high,
             "medium": medium,
             "low": low,
-            "files_scanned": files_scanned
+            "files_scanned": files_scanned,
+            "files_skipped": files_skipped
         },
         "findings": findings
     });
@@ -732,22 +727,36 @@ fn render_markdown(findings: &[Finding]) -> String {
         out.push_str("No issues found.\n");
         return out;
     }
-    out.push_str("| # | Severity | File | Line | Check | Function |\n");
-    out.push_str("|---|----------|------|------|-------|----------|\n");
+    out.push_str("| # | Severity | File | Line | Check | Function | Description | Suggestion |\n");
+    out.push_str("|---|----------|------|------|-------|----------|-------------|------------|\n");
     for (i, f) in findings.iter().enumerate() {
         let sev = match f.severity {
             Severity::High => "**HIGH**",
             Severity::Medium => "MEDIUM",
             Severity::Low => "LOW",
         };
+        // Link the check name to rule_url when available, else plain text.
+        let check_cell = if let Some(ref url) = f.rule_url {
+            format!("[{}]({})", escape_md_cell(&f.check_name), url)
+        } else {
+            escape_md_cell(&f.check_name)
+        };
+        let description_cell = escape_md_cell(&f.description);
+        let suggestion_cell = f
+            .suggestion
+            .as_deref()
+            .map(escape_md_cell)
+            .unwrap_or_default();
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             i + 1,
             sev,
-            f.file_path,
+            escape_md_cell(&f.file_path),
             f.line,
-            f.check_name,
-            f.function_name
+            check_cell,
+            escape_md_cell(&f.function_name),
+            description_cell,
+            suggestion_cell,
         ));
     }
     let high = findings
@@ -770,6 +779,11 @@ fn render_markdown(findings: &[Finding]) -> String {
         low
     ));
     out
+}
+
+/// Escape `|` and newlines so interpolated values cannot break the Markdown table.
+fn escape_md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ").replace('\r', "")
 }
 
 fn summary_text(findings: &[Finding], files_scanned: usize) -> String {
@@ -909,7 +923,7 @@ mod tests {
             suggestion: None,
         }];
 
-        let payload = build_sarif(&findings);
+        let payload = build_sarif(&findings, 0);
         assert_eq!(payload["version"], "2.1.0");
         assert_eq!(
             payload["runs"][0]["tool"]["driver"]["name"],
@@ -937,7 +951,7 @@ mod tests {
         }];
 
         let payload: serde_json::Value =
-            serde_json::from_str(&json_payload(&findings, 1).unwrap()).unwrap();
+            serde_json::from_str(&json_payload(&findings, 1, 0).unwrap()).unwrap();
         assert_eq!(payload["findings"][0]["rule_url"], rule_url);
     }
 
@@ -967,12 +981,13 @@ mod tests {
         ];
 
         let payload: serde_json::Value =
-            serde_json::from_str(&json_payload(&findings, 3).unwrap()).unwrap();
+            serde_json::from_str(&json_payload(&findings, 3, 2).unwrap()).unwrap();
         assert_eq!(payload["summary"]["total"], 2);
         assert_eq!(payload["summary"]["high"], 1);
         assert_eq!(payload["summary"]["medium"], 1);
         assert_eq!(payload["summary"]["low"], 0);
         assert_eq!(payload["summary"]["files_scanned"], 3);
+        assert_eq!(payload["summary"]["files_skipped"], 2);
     }
 
     #[test]
@@ -1013,17 +1028,22 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let payload = serde_json::to_string_pretty(&build_sarif(&findings)).unwrap();
+        let payload = serde_json::to_string_pretty(&build_sarif(&findings, 1)).unwrap();
         write_output(&path, &payload).unwrap();
         assert!(path.exists());
         let contents = fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(parsed["version"], "2.1.0");
+        assert_eq!(
+            parsed["runs"][0]["invocations"][0]["properties"]["files_skipped"],
+            1
+        );
         let _ = fs::remove_file(path);
     }
 
     #[test]
     fn markdown_written_to_file_when_output_provided() {
+        let rule_url = "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#missing-require-auth-high";
         let findings = vec![
             Finding {
                 check_name: "missing-require-auth".to_string(),
@@ -1032,8 +1052,8 @@ mod tests {
                 line: 10,
                 function_name: "set_balance".to_string(),
                 description: "Missing require_auth".to_string(),
-                rule_url: None,
-                suggestion: None,
+                rule_url: Some(rule_url.to_string()),
+                suggestion: Some("Add env.require_auth();".to_string()),
             },
             Finding {
                 check_name: "unchecked-arithmetic".to_string(),
@@ -1075,13 +1095,33 @@ mod tests {
             contents.contains("**HIGH**"),
             "High severity should be bold in Markdown"
         );
+        // Check name linked to rule_url when present
         assert!(
-            contents.contains("missing-require-auth"),
-            "should contain the check name"
+            contents.contains(&format!("[missing-require-auth]({})", rule_url)),
+            "check name should be linked to rule_url"
         );
         assert!(
             contents.contains("unchecked-arithmetic"),
             "should contain the second check name"
+        );
+        // New Description column
+        assert!(
+            contents.contains("Missing require_auth"),
+            "should contain the description"
+        );
+        // New Suggestion column
+        assert!(
+            contents.contains("Add env.require_auth();"),
+            "should contain the suggestion"
+        );
+        // Column headers
+        assert!(
+            contents.contains("Description"),
+            "should have a Description column header"
+        );
+        assert!(
+            contents.contains("Suggestion"),
+            "should have a Suggestion column header"
         );
         assert!(
             contents.contains("2 finding(s): 1 High, 1 Medium, 0 Low"),

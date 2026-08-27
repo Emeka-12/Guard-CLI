@@ -47,6 +47,7 @@ emits a reduced envelope instead:
 | `medium` | integer | Count of `"medium"` findings |
 | `low` | integer | Count of `"low"` findings |
 | `files_scanned` | integer | Number of `.rs` files that were parsed |
+| `files_skipped` | integer | Number of `.rs` files skipped because they carried a generated-file header (`// @generated`, `// Code generated`, or `// DO NOT EDIT` in the first five lines). A non-zero value means the scan did not cover all sources; `0` indicates a complete scan. |
 
 All fields are always present; counts are `0` when there are no findings of
 that severity.
@@ -57,7 +58,8 @@ that severity.
   "high": 1,
   "medium": 1,
   "low": 1,
-  "files_scanned": 4
+  "files_scanned": 4,
+  "files_skipped": 0
 }
 ```
 
@@ -140,7 +142,8 @@ value identically (i.e. use an optional/nullable field type, not a required one)
     "high": 1,
     "medium": 1,
     "low": 0,
-    "files_scanned": 3
+    "files_scanned": 3,
+    "files_skipped": 0
   },
   "findings": [
     {
