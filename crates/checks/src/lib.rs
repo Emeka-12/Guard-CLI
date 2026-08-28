@@ -79,7 +79,7 @@ use syn::File;
 ///
 /// The `PartialOrd`/`Ord` implementation orders variants High → Medium → Low so
 /// that `BTreeMap<Severity, _>` naturally sorts from most to least severe.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     High,

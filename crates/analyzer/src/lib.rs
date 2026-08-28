@@ -168,9 +168,22 @@ fn is_suppressed(finding: &Finding, suppressions: &Suppressions, fn_spans: &[FnS
     ))
 }
 
+/// Drop only findings that are identical in everything a reader would use to tell
+/// them apart. Keying on `(file, line, check_name)` alone collapsed distinct
+/// same-line findings from checks that legitimately report more than once per line
+/// (e.g. one `unchecked-arithmetic` hit per operator).
 fn dedup_findings(findings: &mut Vec<Finding>) {
     let mut seen = HashSet::new();
-    findings.retain(|f| seen.insert((f.file_path.clone(), f.line, f.check_name.clone())));
+    findings.retain(|f| {
+        seen.insert((
+            f.file_path.clone(),
+            f.line,
+            f.check_name.clone(),
+            f.function_name.clone(),
+            f.description.clone(),
+            f.severity,
+        ))
+    });
 }
 
 /// Collect `.rs` paths under `root`, applying exclude/include glob filters and skipping
@@ -740,6 +753,58 @@ mod dedup_tests {
                 lines
             );
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A check that reports two findings at the same `(file, line, check_name)` that
+    /// differ only in their description — the shape produced by per-operator checks
+    /// like `unchecked-arithmetic` on a single source line.
+    struct DistinctSameLineCheck;
+    impl soroban_guard_checks::Check for DistinctSameLineCheck {
+        fn name(&self) -> &str {
+            "distinct-same-line"
+        }
+        fn run(&self, _file: &syn::File, _src: &str) -> Vec<Finding> {
+            let base = Finding {
+                check_name: "distinct-same-line".into(),
+                severity: Severity::Medium,
+                file_path: String::new(),
+                line: 3,
+                function_name: "f".into(),
+                description: String::new(),
+                rule_url: None,
+                suggestion: None,
+            };
+            vec![
+                Finding {
+                    description: "addition may overflow".into(),
+                    ..base.clone()
+                },
+                Finding {
+                    description: "multiplication may overflow".into(),
+                    ..base
+                },
+            ]
+        }
+    }
+
+    #[test]
+    fn keeps_distinct_findings_on_the_same_line() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-dedup-distinct-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let checks: Vec<Box<dyn soroban_guard_checks::Check + Send + Sync>> =
+            vec![Box::new(DistinctSameLineCheck)];
+        let (results, _, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
+
+        let total: usize = results.iter().map(|r| r.findings.len()).sum();
+        assert_eq!(total, 2, "distinct same-line findings must both survive dedup, got {total}");
 
         fs::remove_dir_all(root).unwrap();
     }
