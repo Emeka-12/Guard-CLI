@@ -4,6 +4,7 @@
 
 use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
 use crate::{Check, Finding, Severity};
+use std::collections::HashSet;
 use syn::visit::{self, Visit};
 use syn::{Expr, ExprMethodCall, File};
 
@@ -25,7 +26,7 @@ impl Check for UnboundedVecGrowthCheck {
             if scan.has_storage_get
                 && scan.has_push_or_append
                 && scan.has_storage_set
-                && !scan.has_len_check
+                && !scan.has_len_check()
             {
                 let line = scan
                     .push_line
@@ -62,8 +63,22 @@ struct BodyScan {
     has_storage_get: bool,
     has_push_or_append: bool,
     has_storage_set: bool,
-    has_len_check: bool,
+    push_receivers: HashSet<String>,
+    len_receivers: HashSet<String>,
     push_line: Option<usize>,
+}
+
+impl BodyScan {
+    /// A length check only counts if a `.len()` call targets the same receiver that is
+    /// actually being pushed to — an unrelated `.len()` must not suppress the finding.
+    fn has_len_check(&self) -> bool {
+        !self.push_receivers.is_disjoint(&self.len_receivers)
+    }
+}
+
+fn receiver_key(e: &Expr) -> String {
+    use quote::ToTokens;
+    e.to_token_stream().to_string()
 }
 
 impl<'ast> Visit<'ast> for BodyScan {
@@ -77,13 +92,82 @@ impl<'ast> Visit<'ast> for BodyScan {
         }
         if matches!(method.as_str(), "push" | "push_back" | "append") {
             self.has_push_or_append = true;
+            self.push_receivers.insert(receiver_key(&i.receiver));
             if self.push_line.is_none() {
                 self.push_line = Some(i.method.span().start().line);
             }
         }
         if method == "len" {
-            self.has_len_check = true;
+            self.len_receivers.insert(receiver_key(&i.receiver));
         }
         visit::visit_expr_method_call(self, i);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Check;
+    use syn::parse_file;
+
+    fn run(src: &str) -> Vec<Finding> {
+        let file = parse_file(src).expect("parse");
+        UnboundedVecGrowthCheck.run(&file, src)
+    }
+
+    #[test]
+    fn flags_unbounded_push_despite_unrelated_len_call() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Vec};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn add(env: Env, other: Vec<u32>) {
+        let mut entries: Vec<u32> = env.storage().instance().get(&0).unwrap().unwrap();
+        entries.push(1u32);
+        let _ = other.len();
+        env.storage().instance().set(&0, &entries);
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].check_name, CHECK_NAME);
+    }
+
+    #[test]
+    fn passes_when_len_check_targets_pushed_receiver() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Vec};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn add(env: Env, max: u32) {
+        let mut entries: Vec<u32> = env.storage().instance().get(&0).unwrap().unwrap();
+        entries.push(1u32);
+        if entries.len() >= max {
+            panic!("capacity exceeded");
+        }
+        env.storage().instance().set(&0, &entries);
+    }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn flags_when_no_length_check_at_all() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Vec};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn add(env: Env) {
+        let mut entries: Vec<u32> = env.storage().instance().get(&0).unwrap().unwrap();
+        entries.push(1u32);
+        env.storage().instance().set(&0, &entries);
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
     }
 }
