@@ -121,6 +121,29 @@ Use `--exclude` to skip a path pattern entirely:
 cargo run -p soroban-guard-cli -- scan ./my-contract --exclude src/proxy.rs
 ```
 
+### Include only specific files
+
+Use `--include` to restrict the scan to files whose paths match a glob pattern. Only matching
+files are analysed; everything else is skipped:
+
+```bash
+cargo run -p soroban-guard-cli -- scan ./my-contract --include 'src/token*.rs'
+```
+
+`--include` and `--exclude` can be combined — `--exclude` is applied after `--include`, so a
+file must match an include pattern *and* not match any exclude pattern to be scanned:
+
+```bash
+cargo run -p soroban-guard-cli -- scan ./my-contract \
+    --include 'src/*.rs' \
+    --exclude 'src/generated.rs'
+```
+
+> **Known limitation (issue [#316](https://github.com/SorobanGuard/Guard-CLI/issues/316)):**
+> `--include` currently accepts only a single pattern per invocation. If you need to match
+> several disjoint patterns you must run the scanner once per pattern, or use a broader glob
+> that covers all the files you want. Track the linked issue for updates.
+
 ---
 
 ## Reporting a false positive
