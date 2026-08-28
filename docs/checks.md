@@ -571,6 +571,45 @@ Persistent contract storage entries eventually expire. Without an explicit TTL e
 
 ---
 
+## `missing-input-length-bound` (Medium)
+
+**What it detects**
+
+Public methods inside `#[contractimpl]` impl blocks that accept a `Bytes` or `Vec` parameter without a `.len()` or `.is_empty()` check for that parameter in the method body.
+
+**Why it matters**
+
+Unbounded caller-provided collections can make a contract perform excessive work or consume more resources than expected. Checking the input length and rejecting values above the contract's intended maximum helps keep execution and storage costs predictable.
+
+**Example**
+
+```rust
+#[contractimpl]
+impl Contract {
+	pub fn process(env: Env, data: Bytes) {
+		// Finding: data is used without a length check.
+		env.storage().instance().set(&symbol_short!("data"), &data);
+	}
+
+	pub fn process_bounded(env: Env, data: Bytes) {
+		if data.len() > 1024 {
+			panic!("input too large");
+		}
+		env.storage().instance().set(&symbol_short!("data"), &data);
+	}
+}
+```
+
+**Limitations and known false positives**
+
+- The check is syntactic: any `.len()` or `.is_empty()` call on the parameter clears the finding, even if it does not enforce a useful maximum or minimum.
+- It does not infer collection types beyond the `Bytes`/`Vec` text matched by the detector, and type aliases may be missed or misclassified.
+- Validation performed in a helper function is not visible to this check.
+
+**Fixture:** tests in `crates/checks/src/missing_input_length_bound.rs`
+
+---
+
 ## `large-loop` (Medium)
 
 **What it detects**
