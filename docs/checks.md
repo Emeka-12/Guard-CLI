@@ -40,10 +40,28 @@ In a `#[contractimpl]` method, a storage mutation through `env.storage()` (`set`
 
 Authorization should happen before state mutation. If a contract writes to storage before requiring auth, an attacker may influence state changes without being authorized.
 
+**Example**
+
+```rust
+#[contractimpl]
+impl Contract {
+	pub fn update(env: Env, value: u32) {
+		env.storage().instance().set(&symbol_short!("value"), &value);
+		env.require_auth(); // Finding: authorization follows the write.
+	}
+
+	pub fn update_safely(env: Env, value: u32) {
+		env.require_auth();
+		env.storage().instance().set(&symbol_short!("value"), &value);
+	}
+}
+```
+
 **Limitations**
 
 - Only the `Env` binding named `env` or the explicit environment parameter name is recognized.
 - Static analysis cannot see auth enforced inside helper functions or via dataflow beyond the method body.
+- The check compares the first storage write with the first auth call in source order; complex branching may produce a finding even when every runtime path authorizes before writing.
 
 **Fixture:** `test-contracts/auth-order-vulnerable/`, `test-contracts/auth-order-safe/`
 
@@ -553,11 +571,50 @@ Persistent contract storage entries eventually expire. Without an explicit TTL e
 
 ---
 
+## `missing-input-length-bound` (Medium)
+
+**What it detects**
+
+Public methods inside `#[contractimpl]` impl blocks that accept a `Bytes` or `Vec` parameter without a `.len()` or `.is_empty()` check for that parameter in the method body.
+
+**Why it matters**
+
+Unbounded caller-provided collections can make a contract perform excessive work or consume more resources than expected. Checking the input length and rejecting values above the contract's intended maximum helps keep execution and storage costs predictable.
+
+**Example**
+
+```rust
+#[contractimpl]
+impl Contract {
+	pub fn process(env: Env, data: Bytes) {
+		// Finding: data is used without a length check.
+		env.storage().instance().set(&symbol_short!("data"), &data);
+	}
+
+	pub fn process_bounded(env: Env, data: Bytes) {
+		if data.len() > 1024 {
+			panic!("input too large");
+		}
+		env.storage().instance().set(&symbol_short!("data"), &data);
+	}
+}
+```
+
+**Limitations and known false positives**
+
+- The check is syntactic: any `.len()` or `.is_empty()` call on the parameter clears the finding, even if it does not enforce a useful maximum or minimum.
+- It does not infer collection types beyond the `Bytes`/`Vec` text matched by the detector, and type aliases may be missed or misclassified.
+- Validation performed in a helper function is not visible to this check.
+
+**Fixture:** tests in `crates/checks/src/missing_input_length_bound.rs`
+
+---
+
 ## `large-loop` (Medium)
 
 **What it detects**
 
-Inside `#[contractimpl]` public methods: `loop { … }` and `while <cond> { … }` constructs that have no obvious bound — i.e. any `loop` or `while` expression found in the method body.
+Inside `#[contractimpl]` public methods: `loop { … }`, `while <cond> { … }`, or `for <pattern> in <expr> { … }` constructs. The check treats every loop expression as potentially large or unbounded.
 
 **Why it matters**
 
@@ -565,8 +622,8 @@ Soroban contracts run under a fixed compute-budget cap. An unbounded loop can ex
 
 **Limitations**
 
-- Does not distinguish loops with a provably finite iteration count (e.g. `while i < 10`) from genuinely unbounded ones — all `loop`/`while` constructs are flagged.
-- `for` loops over iterators are not flagged; callers should still audit iterator sources for large collections.
+- Does not distinguish loops with a provably finite iteration count (e.g. `while i < 10`) from genuinely unbounded ones — all `loop`, `while`, and `for` constructs are flagged.
+- It does not estimate collection size or iteration count, so a bounded `for` loop may still be reported.
 - Loops inside private helper functions called from a `#[contractimpl]` method are not detected.
 
 **Fixture:** `test-contracts/large-loop-vulnerable/`, `test-contracts/large-loop-safe/`

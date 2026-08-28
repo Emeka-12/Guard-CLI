@@ -76,9 +76,14 @@ impl<'ast> Visit<'ast> for XcInputVisitor<'ast> {
         // Collect `let <ident> = …invoke_contract(…)` bindings.
         if let Stmt::Local(local) = stmt {
             if let Some(init) = &local.init {
-                if is_invoke_contract(&init.expr) {
-                    if let Pat::Ident(pi) = &local.pat {
+                if let Pat::Ident(pi) = &local.pat {
+                    if is_invoke_contract(&init.expr) {
+                        // New tainted binding.
                         self.xc_bindings.insert(pi.ident.to_string());
+                    } else {
+                        // Re-binding under the same name to a non-invoke value clears any
+                        // prior taint: the variable has been validated/transformed.
+                        self.xc_bindings.remove(&pi.ident.to_string());
                     }
                 }
             }
@@ -188,6 +193,23 @@ pub struct C;
 impl C {
     pub fn store(env: Env, val: i128) {
         env.storage().persistent().set(&Symbol::short("k"), &val);
+    }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn passes_when_tainted_binding_is_shadowed_by_validated_value() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address, Symbol};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn relay(env: Env, callee: Address, sym: Symbol) {
+        let result = env.invoke_contract::<i128>(&callee, &sym, ());
+        let result = if result > 0 { result } else { 0 };
+        env.storage().persistent().set(&Symbol::short("k"), &result);
     }
 }
 "#);
