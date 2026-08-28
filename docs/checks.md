@@ -40,10 +40,28 @@ In a `#[contractimpl]` method, a storage mutation through `env.storage()` (`set`
 
 Authorization should happen before state mutation. If a contract writes to storage before requiring auth, an attacker may influence state changes without being authorized.
 
+**Example**
+
+```rust
+#[contractimpl]
+impl Contract {
+	pub fn update(env: Env, value: u32) {
+		env.storage().instance().set(&symbol_short!("value"), &value);
+		env.require_auth(); // Finding: authorization follows the write.
+	}
+
+	pub fn update_safely(env: Env, value: u32) {
+		env.require_auth();
+		env.storage().instance().set(&symbol_short!("value"), &value);
+	}
+}
+```
+
 **Limitations**
 
 - Only the `Env` binding named `env` or the explicit environment parameter name is recognized.
 - Static analysis cannot see auth enforced inside helper functions or via dataflow beyond the method body.
+- The check compares the first storage write with the first auth call in source order; complex branching may produce a finding even when every runtime path authorizes before writing.
 
 **Fixture:** `test-contracts/auth-order-vulnerable/`, `test-contracts/auth-order-safe/`
 
