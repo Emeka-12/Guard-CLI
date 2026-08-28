@@ -42,7 +42,10 @@ impl Check for MissingEventEmissionCheck {
                      `env.events().publish(…)` to allow off-chain indexers to track contract activity."
                 ),
                 rule_url: None,
-                suggestion: None,
+                suggestion: Some(format!(
+                    "Add `env.events().publish((symbol_short!(\"{fn_name}\"), …), &payload)` \
+                     after the storage write so off-chain indexers can track this state change."
+                )),
             });
         }
         out

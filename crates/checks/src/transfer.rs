@@ -44,7 +44,10 @@ impl Check for SelfTransferCheck {
                      self-transfers can artificially inflate volume or extract fees."
                 ),
                 rule_url: None,
-                suggestion: None,
+                suggestion: Some(format!(
+                    "Add a guard at the top of `{fn_name}`: \
+                     `if from == to {{ return; }}` (or panic) to prevent self-transfers."
+                )),
             });
         }
         out
