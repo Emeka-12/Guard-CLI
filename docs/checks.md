@@ -557,7 +557,7 @@ Persistent contract storage entries eventually expire. Without an explicit TTL e
 
 **What it detects**
 
-Inside `#[contractimpl]` public methods: `loop { … }` and `while <cond> { … }` constructs that have no obvious bound — i.e. any `loop` or `while` expression found in the method body.
+Inside `#[contractimpl]` public methods: `loop { … }`, `while <cond> { … }`, or `for <pattern> in <expr> { … }` constructs. The check treats every loop expression as potentially large or unbounded.
 
 **Why it matters**
 
@@ -565,8 +565,8 @@ Soroban contracts run under a fixed compute-budget cap. An unbounded loop can ex
 
 **Limitations**
 
-- Does not distinguish loops with a provably finite iteration count (e.g. `while i < 10`) from genuinely unbounded ones — all `loop`/`while` constructs are flagged.
-- `for` loops over iterators are not flagged; callers should still audit iterator sources for large collections.
+- Does not distinguish loops with a provably finite iteration count (e.g. `while i < 10`) from genuinely unbounded ones — all `loop`, `while`, and `for` constructs are flagged.
+- It does not estimate collection size or iteration count, so a bounded `for` loop may still be reported.
 - Loops inside private helper functions called from a `#[contractimpl]` method are not detected.
 
 **Fixture:** `test-contracts/large-loop-vulnerable/`, `test-contracts/large-loop-safe/`
