@@ -43,7 +43,10 @@ impl<'ast> Visit<'ast> for DeploymentVisitor {
                                 description:
                                     "Contract deployment call lacks require_auth protection"
                                         .to_string(),
-                                rule_url: None,
+                                rule_url: Some(
+                                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unprotected-contract-deployment-high"
+                                        .to_string(),
+                                ),
                                 suggestion: Some(
                                     "Add env.require_auth() before deployment operations"
                                         .to_string(),

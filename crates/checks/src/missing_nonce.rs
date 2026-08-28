@@ -45,7 +45,10 @@ impl<'ast> Visit<'ast> for NonceVisitor {
                                 description:
                                     "State-mutating method with Address parameter lacks nonce/replay protection"
                                         .to_string(),
-                                rule_url: None,
+                                rule_url: Some(
+                                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#missing-nonce-medium"
+                                        .to_string(),
+                                ),
                                 suggestion: Some(
                                     "Add nonce or sequence number validation to prevent replay attacks"
                                         .to_string(),

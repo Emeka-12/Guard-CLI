@@ -50,14 +50,3 @@ pub fn load(scan_root: &Path) -> Result<Option<GuardConfig>, String> {
         .map_err(|e| format!("{}: {e}", config_path.display()))?;
     Ok(Some(cfg))
 }
-
-
-#[contractimpl]
-impl VulnerableContract {
-    /// Increments stored counter with no `env.require_auth()` — should trigger `missing-require-auth`.
-    pub fn bump(env: Env) {
-        let mut n: u32 = env.storage().instance().get(&KEY).unwrap_or(0);
-        n += 1;
-        env.storage().instance().set(&KEY, &n);
-    }
-}
