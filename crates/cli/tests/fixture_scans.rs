@@ -107,6 +107,34 @@ fn uninitialized_storage_read_fixtures() {
     assert_fixture_pair("uninitialized-storage-read", "uninitialized-storage-read");
 }
 
+#[test]
+fn ttl_fixtures() {
+    assert_fixture_pair("ttl", "missing-ttl-extension");
+}
+
+/// Regression test for issue #362: a function that writes two distinct persistent keys but
+/// only calls extend_ttl on one of them must still produce a finding for the unextended key.
+/// The old function-scoped `has_extend` flag would have suppressed both findings.
+#[test]
+fn ttl_mixed_key_scenario_produces_finding() {
+    let path = fixture_path("ttl-vulnerable");
+    let (findings, _, _) = scan_directory(&path, &[], &[])
+        .expect("failed to scan ttl-vulnerable");
+
+    // The `update` function writes KEY and KEY2 but only extends TTL for KEY2.
+    // There must be at least one finding for KEY's missing extension in `update`.
+    let update_findings: Vec<_> = findings
+        .iter()
+        .filter(|f| f.check_name == "missing-ttl-extension" && f.function_name == "update")
+        .collect();
+
+    assert!(
+        !update_findings.is_empty(),
+        "expected a missing-ttl-extension finding in `update` for the unextended key, \
+         got findings: {findings:#?}"
+    );
+}
+
 /// Verify that `soroban-guard.toml` is read and its `[checks.sensitive_names].extra` list
 /// extends the built-in admin check so that custom function names are flagged.
 #[test]
