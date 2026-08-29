@@ -2,6 +2,7 @@ use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
 use syn::spanned::Spanned;
 use syn::{ImplItem, ItemImpl, FnArg, Pat};
+use quote::ToTokens;
 
 
 const CHECK_NAME: &str = "missing-input-length-bound";
@@ -94,7 +95,12 @@ fn find_bytes_vec_params(
 }
 
 fn has_length_check(block: &syn::Block, param_name: &str) -> bool {
-    let block_text = format!("{:?}", block);
+    let block_text: String = block
+        .to_token_stream()
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let len_check = format!("{}.len()", param_name);
     let is_empty = format!("{}.is_empty()", param_name);
     block_text.contains(&len_check) || block_text.contains(&is_empty)
