@@ -89,9 +89,19 @@ impl<'ast> Visit<'ast> for BodyScan {
             .last()
             .map(|s| s.ident.to_string())
             .unwrap_or_default();
-        if matches!(name.as_str(), "require" | "panic") {
-            self.has_guard = true;
+        if name == "require" {
+            // `require!(<cond>, ...)` only counts as a re-init guard when `<cond>` itself
+            // is a storage presence check, e.g. `require!(!env.storage().instance().has(&k), ..)`.
+            // A `require!` validating unrelated input (e.g. `require!(fee >= 0, ..)`) must not
+            // count, since it never gates the storage write.
+            if let Ok(cond) = i.parse_body_with(syn::Expr::parse_without_eager_brace) {
+                if is_storage_guard_check(&cond) {
+                    self.has_guard = true;
+                }
+            }
         }
+        // A bare `panic!(..)` is only a guard when it is the divergent branch of an
+        // `if` whose condition is itself a storage guard check (handled in `visit_expr_if`).
         visit::visit_macro(self, i);
     }
 }
@@ -199,6 +209,38 @@ impl C {
 }
 "#);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn flags_init_when_require_only_validates_unrelated_input() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn initialize(env: Env, admin: Address, fee: i128) {
+        require!(fee >= 0, "bad fee");
+        env.storage().instance().set(&0, &admin);
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn passes_when_require_guard_checks_storage_presence() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn initialize(env: Env, admin: Address) {
+        require!(!env.storage().instance().has(&0), "already initialized");
+        env.storage().instance().set(&0, &admin);
+    }
+}
+"#);
+        assert!(hits.is_empty());
     }
 
     #[test]
