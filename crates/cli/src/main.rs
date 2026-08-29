@@ -65,6 +65,9 @@ enum Commands {
         /// Watch for .rs file changes and re-run the scan automatically
         #[arg(long, short = 'w')]
         watch: bool,
+        /// Cap the number of findings printed to stdout (0 = unlimited, default: 0)
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        max_findings: usize,
     },
     /// List the checks that are enabled by default
     ListChecks,
@@ -94,6 +97,7 @@ struct ScanOptions {
     fail_threshold: Severity,
     exclude: Vec<String>,
     includes: Vec<String>,
+    max_findings: usize,
 }
 
 /// Whether scan results should be printed. `--quiet` suppresses output only while the
@@ -157,8 +161,9 @@ fn run_scan(
                     }
                 }
             } else if should_print_results(opts.quiet, should_fail) {
-                let (display, truncated) = truncate(&findings, 0);
+                let (display, truncated) = truncate(&findings, opts.max_findings);
                 print_pretty(
+                    &findings,
                     display,
                     files_scanned,
                     opts.path.display().to_string(),
@@ -260,6 +265,7 @@ fn main() {
             fail_on,
             disable_check,
             watch,
+            max_findings,
         } => {
             if no_color || std::env::var_os("NO_COLOR").is_some() {
                 colored::control::set_override(false);
@@ -359,6 +365,7 @@ fn main() {
                 fail_threshold,
                 exclude: exclude.clone(),
                 includes: include.clone(),
+                max_findings,
             };
 
             // Run the initial scan.
@@ -869,6 +876,7 @@ fn style_check_name(check_name: &str, severity: Severity) -> String {
 
 fn print_pretty(
     findings: &[Finding],
+    display: &[Finding],
     files_scanned: usize,
     root_label: String,
     truncated_count: usize,
@@ -881,17 +889,17 @@ fn print_pretty(
     );
     println!();
 
-    if findings.is_empty() && truncated_count == 0 {
+    if display.is_empty() && truncated_count == 0 {
         println!("  {}", "No issues found.".green());
         println!();
     } else {
-        let total = findings.len() + truncated_count;
+        let total = display.len() + truncated_count;
         println!(
             "  {} finding(s):\n",
             total.to_string().yellow().bold()
         );
 
-        for (i, f) in findings.iter().enumerate() {
+        for (i, f) in display.iter().enumerate() {
             let sev = match f.severity {
                 Severity::High => "HIGH".red().bold(),
                 Severity::Medium => "MEDIUM".magenta().bold(),
@@ -1206,20 +1214,80 @@ mod tests {
     }
 
     #[test]
+    fn truncate_limits_display_when_max_is_smaller_than_findings() {
+        let findings = vec![
+            sample_finding("check-a", Severity::High, 1),
+            sample_finding("check-b", Severity::Medium, 2),
+            sample_finding("check-c", Severity::Low, 3),
+        ];
+
+        let (display, truncated) = truncate(&findings, 2);
+        assert_eq!(display.len(), 2, "only max findings should be displayed");
+        assert_eq!(truncated, 1, "the rest should be reported as truncated");
+        assert_eq!(display[0].check_name, "check-a");
+        assert_eq!(display[1].check_name, "check-b");
+    }
+
+    #[test]
+    fn truncate_zero_returns_all_findings_untouched() {
+        let findings = vec![
+            sample_finding("check-a", Severity::High, 1),
+            sample_finding("check-b", Severity::Medium, 2),
+        ];
+
+        let (display, truncated) = truncate(&findings, 0);
+        assert_eq!(display.len(), 2, "max 0 must not truncate");
+        assert_eq!(truncated, 0);
+        assert!(std::ptr::eq(display, &findings[..]), "max 0 should return the full slice");
+    }
+
+    #[test]
+    fn truncate_is_a_no_op_when_findings_fit_within_max() {
+        let findings = vec![sample_finding("check-a", Severity::High, 1)];
+
+        let (display, truncated) = truncate(&findings, 5);
+        assert_eq!(display.len(), 1);
+        assert_eq!(truncated, 0);
+    }
+
+    #[test]
+    fn summary_line_counts_full_result_set_after_truncation() {
+        let findings = vec![
+            sample_finding("check-a", Severity::High, 1),
+            sample_finding("check-b", Severity::Medium, 2),
+            sample_finding("check-c", Severity::Low, 3),
+        ];
+
+        let (display, truncated) = truncate(&findings, 2);
+        assert_eq!(display.len(), 2);
+        assert_eq!(truncated, 1);
+        // The summary must be computed over the complete findings list, not the
+        // truncated slice shown to the user (Issue #414).
+        assert_eq!(
+            summary_text(&findings, 4),
+            "1 High, 1 Medium, 1 Low — across 4 file(s)"
+        );
+    }
+
+    #[test]
     fn check_name_styling_is_bold_for_high_and_dimmed_for_low() {
         control::set_override(true);
         let high = style_check_name("high-check", Severity::High);
         let low = style_check_name("low-check", Severity::Low);
 
-        assert!(high.contains("\u{1b}[1m"), "high check name should be bold");
-        assert!(low.contains("\u{1b}[2m"), "low check name should be dimmed");
+        assert!(high.contains("\u{1b}[1;31m"), "high check name should be bold red");
+        assert!(low.contains("\u{1b}[2;37m"), "low check name should be dimmed white");
     }
 
     #[test]
     fn describe_check_covers_all_default_checks() {
         for check in default_checks() {
             let (sev, desc) = describe_check(check.name());
-            assert_ne!(sev, "low", "check {} has fallback severity", check.name());
+            assert!(
+                matches!(sev, "high" | "medium" | "low"),
+                "check {} has invalid severity {sev}",
+                check.name()
+            );
             assert_ne!(desc, "Custom detector", "check {} has fallback description", check.name());
         }
     }

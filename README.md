@@ -122,12 +122,15 @@ cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --disable-check 
 cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --include 'src/token*.rs' --exclude 'src/proxy.rs'
 ```
 
-Suppress output entirely unless a finding meets the `--fail-on` threshold, or print extra scan statistics:
+Suppress output entirely unless a finding meets the `--fail-on` threshold, print extra scan statistics, or cap the number of findings shown in the terminal output:
 
 ```bash
 cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --quiet
 cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --verbose
+cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --max-findings 50
 ```
+
+`--max-findings` caps how many findings the pretty formatter prints (the trailing summary still counts the full result set). Use `--max-findings 0` to show all findings — the default.
 
 Print full documentation for a single check:
 
