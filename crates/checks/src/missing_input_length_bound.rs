@@ -44,7 +44,10 @@ impl<'ast> Visit<'ast> for InputLengthVisitor {
                                         "Parameter `{}` (Bytes/Vec) lacks length validation",
                                         param_name
                                     ),
-                                    rule_url: None,
+                                    rule_url: Some(
+                                        "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#missing-input-length-bound-medium"
+                                            .to_string(),
+                                    ),
                                     suggestion: Some(
                                         "Validate parameter length with .len() or .is_empty()"
                                             .to_string(),

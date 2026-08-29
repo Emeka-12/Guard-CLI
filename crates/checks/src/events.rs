@@ -41,6 +41,11 @@ impl Check for MissingEventEmissionCheck {
                     "Method `{fn_name}` writes to storage but does not emit an event. Consider using \
                      `env.events().publish(…)` to allow off-chain indexers to track contract activity."
                 ),
+                rule_url: Some(
+                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#missing-event-emission-medium"
+                        .to_string(),
+                ),
+                suggestion: None,
                 rule_url: None,
                 suggestion: Some(format!(
                     "Add `env.events().publish((symbol_short!(\"{fn_name}\"), …), &payload)` \

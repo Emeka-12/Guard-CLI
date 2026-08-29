@@ -1,5 +1,9 @@
-use soroban_guard_analyzer::scan_directory;
+use soroban_guard_analyzer::{scan_directory, scan_directory_with_checks};
+use soroban_guard_checks::default_checks_with_config;
 use std::path::PathBuf;
+
+#[path = "../src/config.rs"]
+mod config;
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -75,6 +79,28 @@ fn panic_fixtures() {
 #[test]
 fn reentrancy_fixtures() {
     assert_fixture_pair("reentrancy", "reentrancy-risk");
+}
+
+#[test]
+fn cli_scan_path_does_not_emit_duplicate_findings() {
+    let checks = default_checks_with_config(&[], &[]);
+    let (results, _, _) = scan_directory_with_checks(
+        &fixture_path("reentrancy-vulnerable"),
+        &[],
+        &[],
+        &checks,
+    )
+    .expect("failed to scan reentrancy-vulnerable");
+
+    let findings: Vec<_> = results.into_iter().flat_map(|result| result.findings).collect();
+    let mut keys = std::collections::HashSet::new();
+    for finding in findings {
+        let key = (finding.file_path.clone(), finding.line, finding.check_name.clone());
+        assert!(
+            keys.insert(key),
+            "CLI scan emitted duplicate finding: {finding:?}"
+        );
+    }
 }
 
 #[test]

@@ -47,7 +47,10 @@ impl<'ast> Visit<'ast> for AdminEventVisitor {
                                     "Admin change function `{}` lacks event emission",
                                     name
                                 ),
-                                rule_url: None,
+                                rule_url: Some(
+                                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#missing-event-for-admin-change-medium"
+                                        .to_string(),
+                                ),
                                 suggestion: Some(
                                     "Emit an event with env.events().publish() to track admin changes"
                                         .to_string(),

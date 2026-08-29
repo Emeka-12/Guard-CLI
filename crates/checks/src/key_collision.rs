@@ -43,6 +43,11 @@ impl Check for SymbolKeyCollisionCheck {
                             "Duplicate symbol key `{}` found at position {}",
                             key, pos
                         ),
+                        rule_url: Some(
+                            "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#symbol-key-collision-medium"
+                                .to_string(),
+                        ),
+                        suggestion: None,
                         rule_url: None,
                         suggestion: Some(format!(
                             "Rename one of the duplicate `symbol_short!(\"{key}\")` / \
