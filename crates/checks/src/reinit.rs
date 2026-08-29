@@ -4,7 +4,7 @@
 use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprMethodCall, File};
+use syn::{ExprMethodCall, File};
 
 const CHECK_NAME: &str = "re-initialization-risk";
 
