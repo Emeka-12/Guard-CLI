@@ -104,15 +104,15 @@ fn parse_allow_checks(line: &str) -> Option<Vec<String>> {
     (!checks.is_empty()).then_some(checks)
 }
 
-fn function_name_from_line(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    let fn_pos = trimmed.find("fn ")?;
-    let after_fn = &trimmed[fn_pos + 3..];
-    let name: String = after_fn
-        .chars()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-        .collect();
-    (!name.is_empty()).then_some(name)
+/// Index of the first line at or after `from` that carries actual code, skipping the
+/// lines rustfmt and normal documentation routinely insert between a suppression
+/// comment and the item it applies to: blank lines, `//` / `///` / `//!` comments, and
+/// `#[...]` / `#![...]` attribute lines.
+fn next_substantive_line(lines: &[&str], from: usize) -> Option<usize> {
+    (from..lines.len()).find(|&i| {
+        let t = lines[i].trim_start();
+        !(t.is_empty() || t.starts_with("//") || t.starts_with("#[") || t.starts_with("#!["))
+    })
 }
 
 fn parse_suppressions(source: &str, fn_spans: &[FnSpan]) -> Suppressions {
@@ -123,24 +123,22 @@ fn parse_suppressions(source: &str, fn_spans: &[FnSpan]) -> Suppressions {
         let Some(checks) = parse_allow_checks(line) else {
             continue;
         };
-        let target_idx = idx + 1;
-        let Some(target_line) = lines.get(target_idx) else {
+        let Some(target_idx) = next_substantive_line(&lines, idx + 1) else {
             continue;
         };
-        if let Some(function_name) = function_name_from_line(target_line) {
-            let target_line_number = target_idx + 1;
-            let impl_type = fn_spans
-                .iter()
-                .find(|s| s.start_line == target_line_number && s.function_name == function_name)
-                .map(|s| s.impl_type.clone())
-                .unwrap_or_default();
+        let target_line_number = target_idx + 1;
+        // Resolve the target from the parsed `#[contractimpl]` spans, keyed on the line
+        // the method starts on - never by scanning the raw text for `"fn "`, which also
+        // matches comments, string literals, and type positions.
+        if let Some(span) = fn_spans.iter().find(|s| s.start_line == target_line_number) {
             for check in checks {
-                suppressions
-                    .function_checks
-                    .insert((impl_type.clone(), function_name.clone(), check));
+                suppressions.function_checks.insert((
+                    span.impl_type.clone(),
+                    span.function_name.clone(),
+                    check,
+                ));
             }
         } else {
-            let target_line_number = target_idx + 1;
             for check in checks {
                 suppressions.line_checks.insert((target_line_number, check));
             }
@@ -218,6 +216,65 @@ fn glob_matches(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
         .any(|p| p.matches_path(label) || p.matches_path(path))
 }
 
+/// Compile glob source strings into patterns, surfacing the first invalid one as
+/// `ScanError::InvalidGlobPattern`. Shared by every scan entry point so exclude and
+/// include filters compile identically.
+fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => compiled.push(pattern),
+            Err(e) => {
+                return Err(ScanError::InvalidGlobPattern {
+                    pattern: p.clone(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+    Ok(compiled)
+}
+
+/// Result of applying the shared source-file filter to one candidate path.
+enum PathVerdict {
+    /// A `.rs` file that passed every filter and should be scanned.
+    Scan,
+    /// A `.rs` file omitted because it carries a generated-file header.
+    GeneratedSkip,
+    /// Not a `.rs` file, or excluded by an exclude/include glob.
+    Reject,
+}
+
+fn glob_hit(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
+    patterns
+        .iter()
+        .any(|p| p.matches_path(label) || p.matches_path(path))
+}
+
+/// The single filter every scan entry point applies to a candidate source file:
+/// `.rs` extension, exclude globs, include globs (when non-empty), then the
+/// generated-file header check. `label` is the path relative to the scan root.
+fn classify_rust_path(
+    path: &Path,
+    label: &Path,
+    exclude_patterns: &[glob::Pattern],
+    include_patterns: &[glob::Pattern],
+) -> Result<PathVerdict, ScanError> {
+    if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+        return Ok(PathVerdict::Reject);
+    }
+    if glob_hit(exclude_patterns, label, path) {
+        return Ok(PathVerdict::Reject);
+    }
+    if !include_patterns.is_empty() && !glob_hit(include_patterns, label, path) {
+        return Ok(PathVerdict::Reject);
+    }
+    if has_generated_file_header(path)? {
+        return Ok(PathVerdict::GeneratedSkip);
+    }
+    Ok(PathVerdict::Scan)
+}
+
 /// Collect `.rs` paths under `root`, applying exclude/include glob filters and skipping
 /// files that carry a generated-file header. Returns `(paths, files_skipped)` where
 /// `files_skipped` is the count of files omitted due to the generated-file header.
@@ -244,9 +301,6 @@ fn collect_rust_paths(
             .components()
             .any(|c| matches!(c.as_os_str().to_str(), Some("target" | ".git")))
         {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
         let label = path.strip_prefix(root).unwrap_or(path);
@@ -280,7 +334,6 @@ fn collect_rust_paths(
                 continue;
             }
         }
-        paths.push(path.to_path_buf());
     }
 
     Ok((paths, files_skipped))
@@ -440,16 +493,22 @@ pub fn scan_directory_with_checks(
 
 /// Scan an explicit list of `.rs` file paths and aggregate findings from every default check.
 ///
-/// `root` is used only to compute relative file labels in findings (same convention as
-/// [`scan_directory`]). `excludes` are glob patterns matched against each file's path
-/// relative to `root`; matching files are skipped.
+/// Applies the same per-file filter as [`scan_directory`] via [`classify_rust_path`]:
+/// non-`.rs` paths and paths matching an exclude glob (or, when `includes` is non-empty,
+/// not matching any include glob) are dropped; files carrying a generated-file header are
+/// counted in `files_skipped` and not scanned. Findings are deduplicated before returning.
 ///
-/// Returns `(findings, files_scanned)`.
+/// `root` is used to compute the relative label matched against the globs and shown in
+/// findings. The one difference from [`scan_directory`] is that this does not walk a
+/// directory: only the paths passed in are considered.
+///
+/// Returns `(findings, files_scanned, files_skipped)`.
 pub fn scan_files(
     paths: &[PathBuf],
     root: &Path,
     excludes: &[String],
-) -> Result<(Vec<Finding>, usize), ScanError> {
+    includes: &[String],
+) -> Result<(Vec<Finding>, usize, usize), ScanError> {
     let root = root.canonicalize()?;
     let exclude_patterns = compile_globs(excludes)?;
 
@@ -465,7 +524,7 @@ pub fn scan_files(
     let files_scanned = filtered.len();
     let checks = default_checks();
 
-    let mut findings: Vec<Finding> = filtered
+    let mut findings: Vec<Finding> = selected
         .par_iter()
         .map(|path| run_checks_for_file(path, &root, &checks))
         .collect::<Result<Vec<Vec<Finding>>, ScanError>>()?
@@ -478,8 +537,9 @@ pub fn scan_files(
             .cmp(&b.file_path)
             .then_with(|| a.line.cmp(&b.line))
     });
+    dedup_findings(&mut findings);
 
-    Ok((findings, files_scanned))
+    Ok((findings, files_scanned, files_skipped))
 }
 
 #[cfg(test)]
@@ -607,12 +667,19 @@ mod tests {
         fs::write(&included, "pub fn a() {}").unwrap();
         fs::write(&excluded, "pub fn b() {}").unwrap();
 
-        let (_, files_scanned) = scan_files(&[included, excluded.clone()], &root, &[]).unwrap();
+        let (_, files_scanned, files_skipped) =
+            scan_files(&[included.clone(), excluded.clone()], &root, &[], &[]).unwrap();
         assert_eq!(files_scanned, 2);
+        assert_eq!(files_skipped, 0);
 
         // Exclude one file via glob
-        let (_, files_scanned) =
-            scan_files(&[excluded], &root, &["src/other.rs".to_string()]).unwrap();
+        let (_, files_scanned, _) =
+            scan_files(&[excluded], &root, &["src/other.rs".to_string()], &[]).unwrap();
+        assert_eq!(files_scanned, 0);
+
+        // includes now compose the same way as scan_directory
+        let (_, files_scanned, _) =
+            scan_files(&[included], &root, &[], &["src/other*.rs".to_string()]).unwrap();
         assert_eq!(files_scanned, 0);
 
         fs::remove_dir_all(root).unwrap();
@@ -672,6 +739,51 @@ mod tests {
     }
 
     #[test]
+    fn scan_files_matches_scan_directory_findings_and_filters_generated() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-scan-files-parity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let vulnerable = root.join("src/lib.rs");
+        let generated = root.join("src/generated.rs");
+        fs::write(
+            &vulnerable,
+            "#[contract]\npub struct C;\n#[contractimpl]\nimpl C {\n    pub fn bump(env: Env) {\n        env.storage().instance().set(&1u32, &2u32);\n    }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &generated,
+            "// @generated\n#[contractimpl]\nimpl G {\n    pub fn go(env: Env) { env.storage().instance().set(&1u32, &2u32); }\n}\n",
+        )
+        .unwrap();
+
+        let (dir_findings, _, dir_skipped) = scan_directory(&root, &[], &[]).unwrap();
+        let (file_findings, files_scanned, file_skipped) =
+            scan_files(&[vulnerable, generated], &root, &[], &[]).unwrap();
+
+        assert_eq!(files_scanned, 1, "the generated file must not be scanned");
+        assert_eq!(file_skipped, 1);
+        assert_eq!(file_skipped, dir_skipped);
+
+        let names = |fs: &[Finding]| {
+            let mut v: Vec<(String, usize)> =
+                fs.iter().map(|f| (f.check_name.clone(), f.line)).collect();
+            v.sort();
+            v
+        };
+        assert!(
+            !file_findings.is_empty(),
+            "expected findings from the readable file"
+        );
+        assert_eq!(names(&file_findings), names(&dir_findings));
+    }
+
+    #[test]
     fn scan_directory_rejects_invalid_exclude_glob() {
         let root = std::env::temp_dir().join(format!(
             "soroban-guard-invalid-glob-{}-{}",
@@ -711,6 +823,124 @@ mod tests {
         assert!(err_msg.contains("Invalid glob pattern") || err_msg.contains("src/[invalid.rs"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod suppression_tests {
+    use super::*;
+
+    fn suppressions_for(src: &str) -> Suppressions {
+        let file = syn::parse_file(src).expect("fixture should parse");
+        let fn_spans = build_fn_spans(&file);
+        parse_suppressions(src, &fn_spans)
+    }
+
+    fn has_fn_suppression(s: &Suppressions, func: &str, check: &str) -> bool {
+        let key = (String::from("C"), func.to_string(), check.to_string());
+        s.function_checks.contains(&key)
+    }
+
+    #[test]
+    fn suppression_binds_across_an_attribute_line() {
+        let src = "\
+#[contract]
+pub struct C;
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(missing-require-auth)
+    #[allow(dead_code)]
+    pub fn set_admin(env: Env, a: Address) { let _ = (env, a); }
+}
+";
+        let s = suppressions_for(src);
+        assert!(has_fn_suppression(&s, "set_admin", "missing-require-auth"));
+    }
+
+    #[test]
+    fn suppression_binds_across_a_blank_line() {
+        let src = "\
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(unchecked-arithmetic)
+
+    pub fn accrue(env: Env) { let _ = env; }
+}
+";
+        let s = suppressions_for(src);
+        assert!(has_fn_suppression(&s, "accrue", "unchecked-arithmetic"));
+    }
+
+    #[test]
+    fn suppression_binds_across_a_doc_comment() {
+        let src = "\
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(missing-event-emission)
+    /// Updates the fee schedule.
+    pub fn set_fee(env: Env, bps: u32) { let _ = (env, bps); }
+}
+";
+        let s = suppressions_for(src);
+        assert!(has_fn_suppression(&s, "set_fee", "missing-event-emission"));
+    }
+
+    #[test]
+    fn suppression_directly_above_a_non_fn_statement_stays_line_level() {
+        let src = "\
+#[contractimpl]
+impl C {
+    pub fn go(env: Env) {
+        // soroban-guard: allow(unchecked-arithmetic)
+        let x = 1 + 2;
+        let _ = (env, x);
+    }
+}
+";
+        let s = suppressions_for(src);
+        // line 5 is `let x = 1 + 2;`
+        assert!(s
+            .line_checks
+            .contains(&(5, "unchecked-arithmetic".to_string())));
+        assert!(s.function_checks.is_empty());
+    }
+
+    #[test]
+    fn fn_in_a_string_literal_registers_no_function_suppression() {
+        let src = "\
+#[contractimpl]
+impl C {
+    pub fn go(env: Env) {
+        // soroban-guard: allow(hardcoded-address)
+        let msg = \"call fn later\";
+        let _ = (env, msg);
+    }
+}
+";
+        let s = suppressions_for(src);
+        assert!(s.function_checks.is_empty());
+        assert!(s
+            .line_checks
+            .contains(&(5, "hardcoded-address".to_string())));
+    }
+
+    #[test]
+    fn fn_in_a_type_position_registers_no_function_suppression() {
+        let src = "\
+#[contractimpl]
+impl C {
+    pub fn go(env: Env) {
+        // soroban-guard: allow(unchecked-arithmetic)
+        let handler: fn(u32) -> u32 = double;
+        let _ = (env, handler);
+    }
+}
+";
+        let s = suppressions_for(src);
+        assert!(s.function_checks.is_empty());
+        assert!(s
+            .line_checks
+            .contains(&(5, "unchecked-arithmetic".to_string())));
     }
 }
 
