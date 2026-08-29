@@ -77,7 +77,19 @@ let result = a + b;
 
 Rules:
 
-- The comment must appear on the line immediately before the flagged expression or statement.
+- The comment attaches to the next line of real code. Blank lines, `//` / `///` / `//!`
+  comments, and `#[...]` attribute lines between the annotation and its target are skipped,
+  so this suppresses `set_fee` as expected:
+
+  ```rust
+  // soroban-guard: allow(missing-event-emission)
+  /// Updates the fee schedule.
+  #[allow(dead_code)]
+  pub fn set_fee(env: Env, bps: u32) { /* ... */ }
+  ```
+
+- If the first line of real code below the annotation is a `#[contractimpl]` method, the
+  suppression is function-scoped; otherwise it applies to that single line.
 - The check name inside `allow(...)` must exactly match the check's `name()` value.
 - Multiple checks can be suppressed with a comma-separated list:
   `// soroban-guard: allow(delegate-call-risk, missing-event-emission)`

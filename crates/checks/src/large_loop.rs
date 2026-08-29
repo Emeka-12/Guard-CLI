@@ -47,7 +47,10 @@ impl<'ast> Visit<'ast> for LoopVisitor {
                                 "Unbounded {} loop can exhaust compute budget",
                                 loop_type
                             ),
-                            rule_url: None,
+                            rule_url: Some(
+                                "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#large-loop-medium"
+                                    .to_string(),
+                            ),
                             suggestion: Some(
                                 "Use bounded iteration or add explicit break conditions"
                                     .to_string(),

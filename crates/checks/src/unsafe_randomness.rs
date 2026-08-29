@@ -46,7 +46,10 @@ impl<'ast> Visit<'ast> for RandomnessVisitor {
                         "env.ledger().{}() should not be used as randomness source",
                         method_name
                     ),
-                    rule_url: None,
+                    rule_url: Some(
+                        "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unsafe-randomness-high"
+                            .to_string(),
+                    ),
                     suggestion: Some(
                         "Use oracle services or cryptographic randomness instead".to_string(),
                     ),

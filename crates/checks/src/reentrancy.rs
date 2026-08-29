@@ -41,7 +41,12 @@ impl Check for ReentrancyRiskCheck {
                         "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#reentrancy-risk-high"
                             .to_string(),
                     ),
-                    suggestion: None,
+                    suggestion: Some(format!(
+                        "Move all `env.storage().*.set(…)` calls in `{fn_name}` to \
+                         *after* the `invoke_contract` call (checks-effects-interactions \
+                         pattern), or re-read and re-validate state immediately after \
+                         the external call returns."
+                    )),
                 });
             }
         }

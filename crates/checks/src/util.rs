@@ -96,62 +96,57 @@ mod tests {
         assert_eq!(methods[0].sig.ident.to_string(), "live");
         Ok(())
     }
+
+    #[test]
+    fn receiver_chain_contains_walks_a_nested_chain() -> Result<(), syn::Error> {
+        // `env.storage().persistent().get(&key)` - the `get` call's receiver is
+        // `env.storage().persistent()`, so the walk must pass through two method
+        // calls and the `env` field/path to find each name.
+        let expr: Expr = syn::parse_str("env.storage().persistent().get(&key)")?;
+        let Expr::MethodCall(get_call) = &expr else {
+            panic!("expected a method call");
+        };
+
+        assert!(receiver_chain_contains(&get_call.receiver, "storage"));
+        assert!(receiver_chain_contains(&get_call.receiver, "persistent"));
+        assert!(!receiver_chain_contains(&get_call.receiver, "temporary"));
+        assert!(!receiver_chain_contains(&get_call.receiver, "events"));
+
+        assert!(receiver_chain_contains_storage(&get_call.receiver));
+        assert!(receiver_chain_contains_persistent(&get_call.receiver));
+        Ok(())
+    }
+}
+
+/// Does the receiver chain of `expr` contain a call to `.<method>()`? Walks back through
+/// `Expr::MethodCall` receivers and `Expr::Field` bases. This is the single traversal the
+/// `receiver_chain_contains_*` wrappers below share.
+pub(crate) fn receiver_chain_contains(expr: &Expr, method: &str) -> bool {
+    match expr {
+        Expr::MethodCall(m) => m.method == method || receiver_chain_contains(&m.receiver, method),
+        Expr::Field(f) => receiver_chain_contains(&f.base, method),
+        _ => false,
+    }
 }
 
 /// Does the receiver chain of `expr` contain a call to `.storage()`?
 pub(crate) fn receiver_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "storage" {
-                return true;
-            }
-            receiver_chain_contains_storage(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_storage(&f.base),
-        _ => false,
-    }
+    receiver_chain_contains(expr, "storage")
 }
 
 /// Does the receiver chain of `expr` contain a call to `.events()`?
 pub(crate) fn receiver_chain_contains_events(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "events" {
-                return true;
-            }
-            receiver_chain_contains_events(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_events(&f.base),
-        _ => false,
-    }
+    receiver_chain_contains(expr, "events")
 }
 
 /// Does the receiver chain of `expr` contain a call to `.temporary()`?
 pub(crate) fn receiver_chain_contains_temporary(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "temporary" {
-                return true;
-            }
-            receiver_chain_contains_temporary(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_temporary(&f.base),
-        _ => false,
-    }
+    receiver_chain_contains(expr, "temporary")
 }
 
 /// Does the receiver chain of `expr` contain a call to `.persistent()`?
 pub(crate) fn receiver_chain_contains_persistent(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "persistent" {
-                return true;
-            }
-            receiver_chain_contains_persistent(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_persistent(&f.base),
-        _ => false,
-    }
+    receiver_chain_contains(expr, "persistent")
 }
 
 fn collect_contractimpl_fns<'a>(

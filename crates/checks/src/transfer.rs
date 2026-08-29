@@ -44,8 +44,16 @@ impl Check for SelfTransferCheck {
                      to guard against `from == to`. In fee-on-transfer or rebasing designs, \
                      self-transfers can artificially inflate volume or extract fees."
                 ),
-                rule_url: None,
+                rule_url: Some(
+                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#self-transfer-medium"
+                        .to_string(),
+                ),
                 suggestion: None,
+                rule_url: None,
+                suggestion: Some(format!(
+                    "Add a guard at the top of `{fn_name}`: \
+                     `if from == to {{ return; }}` (or panic) to prevent self-transfers."
+                )),
             });
         }
         out

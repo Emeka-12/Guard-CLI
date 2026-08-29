@@ -65,7 +65,10 @@ impl<'ast> Visit<'ast> for DivisorExprVisitor {
                     line: node.span().start().line,
                     function_name: self.current_function_name.clone(),
                     description,
-                    rule_url: None,
+                    rule_url: Some(
+                        "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unchecked-divisor-high"
+                            .to_string(),
+                    ),
                     suggestion: Some(
                         "Use checked_div or validate divisor > 0 before division".to_string(),
                     ),

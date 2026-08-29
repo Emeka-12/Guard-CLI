@@ -1,6 +1,5 @@
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
-use syn::spanned::Spanned;
 use quote::ToTokens;
 use syn::{ExprMethodCall, Block};
 
@@ -50,7 +49,10 @@ impl<'ast> Visit<'ast> for TokenAmountVisitor {
                         description:
                             "Token transfer amount is not validated to be greater than zero"
                                 .to_string(),
-                        rule_url: None,
+                        rule_url: Some(
+                            "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unchecked-token-amount-medium"
+                                .to_string(),
+                        ),
                         suggestion: Some(
                             "Validate amount > 0 before transfer call".to_string(),
                         ),

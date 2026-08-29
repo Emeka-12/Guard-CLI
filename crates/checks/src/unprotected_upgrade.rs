@@ -45,7 +45,10 @@ impl<'ast> Visit<'ast> for UpgradeVisitor {
                                     "Upgrade/migrate method `{}` lacks require_auth call",
                                     name
                                 ),
-                                rule_url: None,
+                                rule_url: Some(
+                                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unprotected-upgrade-high"
+                                        .to_string(),
+                                ),
                                 suggestion: Some("Add env.require_auth() at the start".to_string()),
                             });
                         }
