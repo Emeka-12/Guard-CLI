@@ -245,6 +245,33 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
     findings.retain(|f| seen.insert((f.file_path.clone(), f.line, f.check_name.clone())));
 }
 
+/// Compile a list of glob source strings into `glob::Pattern`s, surfacing the first
+/// invalid pattern as `ScanError::InvalidGlobPattern`. Shared by the exclude and
+/// include filters so `--include`/`--exclude` stay behaviourally identical.
+fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => compiled.push(pattern),
+            Err(e) => {
+                return Err(ScanError::InvalidGlobPattern {
+                    pattern: p.clone(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+    Ok(compiled)
+}
+
+/// True when any pattern matches the path, tested both against the root-relative
+/// `label` and the full `path` (a pattern like `vendor/**` should match either form).
+fn glob_matches(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
+    patterns
+        .iter()
+        .any(|p| p.matches_path(label) || p.matches_path(path))
+}
+
 /// Collect `.rs` paths under `root`, applying exclude/include glob filters and skipping
 /// files that carry a generated-file header. Returns `(paths, files_skipped)` where
 /// `files_skipped` is the count of files omitted due to the generated-file header.
@@ -253,27 +280,8 @@ fn collect_rust_paths(
     excludes: &[String],
     includes: &[String],
 ) -> Result<(Vec<PathBuf>, usize), ScanError> {
-    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
-    for p in excludes {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => exclude_patterns.push(pattern),
-            Err(e) => return Err(ScanError::InvalidGlobPattern {
-                pattern: p.clone(),
-                reason: e.to_string(),
-            }),
-        }
-    }
-
-    let mut include_patterns: Vec<glob::Pattern> = Vec::new();
-    for p in includes {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => include_patterns.push(pattern),
-            Err(e) => return Err(ScanError::InvalidGlobPattern {
-                pattern: p.clone(),
-                reason: e.to_string(),
-            }),
-        }
-    }
+    let exclude_patterns = compile_globs(excludes)?;
+    let include_patterns = compile_globs(includes)?;
 
     if root.is_file() {
         return Ok((vec![root.to_path_buf()], 0));
@@ -296,17 +304,10 @@ fn collect_rust_paths(
             continue;
         }
         let label = path.strip_prefix(root).unwrap_or(path);
-        if exclude_patterns
-            .iter()
-            .any(|p| p.matches_path(label) || p.matches_path(path))
-        {
+        if glob_matches(&exclude_patterns, label, path) {
             continue;
         }
-        if !include_patterns.is_empty()
-            && !include_patterns
-                .iter()
-                .any(|p| p.matches_path(label) || p.matches_path(path))
-        {
+        if !include_patterns.is_empty() && !glob_matches(&include_patterns, label, path) {
             continue;
         }
         if has_generated_file_header(path)? {
@@ -481,25 +482,14 @@ pub fn scan_files(
     excludes: &[String],
 ) -> Result<(Vec<Finding>, usize), ScanError> {
     let root = root.canonicalize()?;
-    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
-    for p in excludes {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => exclude_patterns.push(pattern),
-            Err(e) => return Err(ScanError::InvalidGlobPattern {
-                pattern: p.clone(),
-                reason: e.to_string(),
-            }),
-        }
-    }
+    let exclude_patterns = compile_globs(excludes)?;
 
     let filtered: Vec<&PathBuf> = paths
         .iter()
         .filter(|path| {
             let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
-            !exclude_patterns
-                .iter()
-                .any(|pat| pat.matches_path(label) || pat.matches_path(&path_canon))
+            !glob_matches(&exclude_patterns, label, &path_canon)
         })
         .collect();
 
