@@ -182,6 +182,17 @@ fn function_name_from_line(line: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// Index of the first line at or after `from` that carries actual code, skipping the
+/// lines rustfmt and normal documentation routinely insert between a suppression
+/// comment and the item it applies to: blank lines, `//` / `///` / `//!` comments, and
+/// `#[...]` / `#![...]` attribute lines.
+fn next_substantive_line(lines: &[&str], from: usize) -> Option<usize> {
+    (from..lines.len()).find(|&i| {
+        let t = lines[i].trim_start();
+        !(t.is_empty() || t.starts_with("//") || t.starts_with("#[") || t.starts_with("#!["))
+    })
+}
+
 fn parse_suppressions(source: &str, fn_spans: &[FnSpan]) -> Suppressions {
     let lines: Vec<&str> = source.lines().collect();
     let mut suppressions = Suppressions::default();
@@ -190,10 +201,10 @@ fn parse_suppressions(source: &str, fn_spans: &[FnSpan]) -> Suppressions {
         let Some(checks) = parse_allow_checks(line) else {
             continue;
         };
-        let target_idx = idx + 1;
-        let Some(target_line) = lines.get(target_idx) else {
+        let Some(target_idx) = next_substantive_line(&lines, idx + 1) else {
             continue;
         };
+        let target_line = lines[target_idx];
         if let Some(function_name) = function_name_from_line(target_line) {
             let target_line_number = target_idx + 1;
             let impl_type = fn_spans
@@ -775,6 +786,86 @@ mod tests {
         assert!(err_msg.contains("Invalid glob pattern") || err_msg.contains("src/[invalid.rs"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod suppression_tests {
+    use super::*;
+
+    fn suppressions_for(src: &str) -> Suppressions {
+        let file = syn::parse_file(src).expect("fixture should parse");
+        let fn_spans = build_fn_spans(&file);
+        parse_suppressions(src, &fn_spans)
+    }
+
+    fn has_fn_suppression(s: &Suppressions, func: &str, check: &str) -> bool {
+        let key = (String::from("C"), func.to_string(), check.to_string());
+        s.function_checks.contains(&key)
+    }
+
+    #[test]
+    fn suppression_binds_across_an_attribute_line() {
+        let src = "\
+#[contract]
+pub struct C;
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(missing-require-auth)
+    #[allow(dead_code)]
+    pub fn set_admin(env: Env, a: Address) { let _ = (env, a); }
+}
+";
+        let s = suppressions_for(src);
+        assert!(has_fn_suppression(&s, "set_admin", "missing-require-auth"));
+    }
+
+    #[test]
+    fn suppression_binds_across_a_blank_line() {
+        let src = "\
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(unchecked-arithmetic)
+
+    pub fn accrue(env: Env) { let _ = env; }
+}
+";
+        let s = suppressions_for(src);
+        assert!(has_fn_suppression(&s, "accrue", "unchecked-arithmetic"));
+    }
+
+    #[test]
+    fn suppression_binds_across_a_doc_comment() {
+        let src = "\
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(missing-event-emission)
+    /// Updates the fee schedule.
+    pub fn set_fee(env: Env, bps: u32) { let _ = (env, bps); }
+}
+";
+        let s = suppressions_for(src);
+        assert!(has_fn_suppression(&s, "set_fee", "missing-event-emission"));
+    }
+
+    #[test]
+    fn suppression_directly_above_a_non_fn_statement_stays_line_level() {
+        let src = "\
+#[contractimpl]
+impl C {
+    pub fn go(env: Env) {
+        // soroban-guard: allow(unchecked-arithmetic)
+        let x = 1 + 2;
+        let _ = (env, x);
+    }
+}
+";
+        let s = suppressions_for(src);
+        // line 5 is `let x = 1 + 2;`
+        assert!(s
+            .line_checks
+            .contains(&(5, "unchecked-arithmetic".to_string())));
+        assert!(s.function_checks.is_empty());
     }
 }
 
