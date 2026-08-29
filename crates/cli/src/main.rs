@@ -8,7 +8,7 @@ use soroban_guard_analyzer::scan_directory_with_checks;
 use soroban_guard_checks::{default_checks, default_checks_with_config, Finding, Severity};
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -391,33 +391,69 @@ fn main() {
                         std::process::exit(2);
                     });
 
-                for res in rx {
+                // Debounce window: coalesce filesystem events arriving within this
+                // duration into a single re-scan. A single atomic editor save produces
+                // Create + several Modify events for the same path, so without this we
+                // would re-walk the whole tree once per event.
+                const DEBOUNCE_DURATION: std::time::Duration =
+                    std::time::Duration::from_millis(300);
+
+                while let Ok(res) = rx.recv() {
                     match res {
                         Ok(event) => {
-                            // Only react to create/modify events on .rs files.
+                            // React to create/modify/remove events on .rs files.
                             let is_relevant = matches!(
                                 event.kind,
-                                EventKind::Create(_) | EventKind::Modify(_)
+                                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                             ) && event.paths.iter().any(|p| {
                                 p.extension().map(|e| e == "rs").unwrap_or(false)
                             });
 
-                            if is_relevant {
-                                // Clear terminal for a clean view.
-                                print!("\x1B[2J\x1B[1;1H");
-
-                                // Print a timestamped re-scan header.
-                                let now = chrono_timestamp();
-                                eprintln!(
-                                    "{}",
-                                    format!("[{}] File changed — re-scanning...", now)
-                                        .cyan()
-                                        .bold()
-                                );
-
-                                run_scan(&opts, &active_checks);
-                                // In watch mode we never exit on findings — keep watching.
+                            if !is_relevant {
+                                continue;
                             }
+
+                            // Drain any additional events that land within the debounce
+                            // window so bursty saves collapse into a single scan.
+                            let deadline = std::time::Instant::now() + DEBOUNCE_DURATION;
+                            while std::time::Instant::now() < deadline {
+                                match rx.recv_timeout(deadline - std::time::Instant::now()) {
+                                    Ok(Ok(e)) => {
+                                        let relevant = matches!(
+                                            e.kind,
+                                            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                                        ) && e.paths.iter().any(|p| {
+                                            p.extension().map(|x| x == "rs").unwrap_or(false)
+                                        });
+                                        if !relevant {
+                                            continue;
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        eprintln!("{} watcher error: {}", "error:".red().bold(), e);
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
+                            // Clear terminal for a clean view.
+                            print!("\x1B[2J\x1B[1;1H");
+                            // Flush so the clear sequence happens in order relative to the
+                            // stderr header on the next line.
+                            let _ = io::stdout().flush();
+
+                            // Print a timestamped re-scan header.
+                            let now = chrono_timestamp();
+                            eprintln!(
+                                "{}",
+                                format!("[{}] File changed — re-scanning...", now)
+                                    .cyan()
+                                    .bold()
+                            );
+
+                            run_scan(&opts, &active_checks);
+                            // In watch mode we never exit on findings — keep watching.
                         }
                         Err(e) => {
                             eprintln!("{} watcher error: {}", "error:".red().bold(), e);
