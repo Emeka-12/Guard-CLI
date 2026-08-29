@@ -44,7 +44,11 @@ impl Check for SymbolKeyCollisionCheck {
                             key, pos
                         ),
                         rule_url: None,
-                        suggestion: None,
+                        suggestion: Some(format!(
+                            "Rename one of the duplicate `symbol_short!(\"{key}\")` / \
+                             `Symbol::new(…, \"{key}\")` usages to a unique key to avoid \
+                             accidental storage slot collisions."
+                        )),
                     });
                 }
             }

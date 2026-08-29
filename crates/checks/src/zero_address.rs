@@ -132,7 +132,11 @@ impl Check for MissingZeroAddressCheck {
                     "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#missing-zero-address-check-medium"
                         .to_string(),
                 ),
-                suggestion: None,
+                suggestion: Some(format!(
+                    "Add `assert!({} != Address::default(), \"zero address\");` at the top \
+                     of `{fn_name}` to reject the default/zero address.",
+                    addr_params.first().map(String::as_str).unwrap_or("addr")
+                )),
             });
         }
         out

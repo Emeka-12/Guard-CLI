@@ -49,7 +49,12 @@ impl Check for DelegateCallRiskCheck {
                              can be redirected to an attacker-controlled contract.",
                         ),
                         rule_url: None,
-                        suggestion: None,
+                        suggestion: Some(
+                            "Pass the callee address as a verified parameter or store it under \
+                             an admin-controlled key; call `caller.require_auth()` before using \
+                             any storage-derived address in `env.invoke_contract`."
+                                .to_string(),
+                        ),
                     });
                 }
             }
