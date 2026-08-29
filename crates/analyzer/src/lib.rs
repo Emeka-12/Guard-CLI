@@ -26,78 +26,6 @@ struct FnSpan {
     end_line: usize,
 }
 
-fn explain_details(name: &str) -> &'static str {
-    match name {
-        "missing-require-auth" => {
-            "Reports contract methods that mutate storage without calling require_auth or require_auth_for_args."
-        }
-        "unchecked-arithmetic" => {
-            "Reports wrapping +, -, *, and compound arithmetic in contract methods; prefer checked_* or saturating_* APIs."
-        }
-        "unprotected-admin" => {
-            "Reports public admin-like entrypoints such as set_owner, pause, migrate, or upgrade when they lack an auth gate."
-        }
-        "unsafe-storage-patterns" => {
-            "Reports temporary storage mutations and dynamic Symbol keys that may expire unexpectedly or collide."
-        }
-        "missing-ttl-extension" => {
-            "Reports persistent storage writes that do not extend TTL in the same function."
-        }
-        "forbidden-std-imports" => {
-            "Reports std imports in Soroban contract files because deployable contracts must compile for no_std WASM."
-        }
-        "hardcoded-address" => {
-            "Reports Stellar public-key-shaped string literals embedded directly in source."
-        }
-        "unsafe-cross-contract-input" => {
-            "Reports invoke_contract return values stored directly without local validation."
-        }
-        "missing-contract-annotation" => {
-            "Reports contractimpl blocks without a sibling struct annotated with #[contract]."
-        }
-        "delegate-call-risk" => {
-            "Reports storage-derived cross-contract callees that can redirect execution if storage is poisoned."
-        }
-        "integer-division-truncation" => {
-            "Reports integer division where truncation may silently change financial or accounting results."
-        }
-        "missing-event-emission" => {
-            "Reports state-mutating functions that do not publish events for off-chain indexers."
-        }
-        "symbol-key-collision" => {
-            "Reports duplicate symbol_short! keys in the same impl block."
-        }
-        "self-transfer" => {
-            "Reports transfer-like functions that do not guard against sender and recipient being equal."
-        }
-        "missing-zero-address-check" => {
-            "Reports Address parameters stored or used without checking for default or zero-address values."
-        }
-        "mutable-global-state" => {
-            "Reports static mut items, which are unsafe and not valid persistent contract state."
-        }
-        "re-initialization-risk" => {
-            "Reports initializer-like methods that write state without checking whether initialization already happened."
-        }
-        "unchecked-invoke-return" => {
-            "Reports bare invoke_contract statements whose return values are discarded."
-        }
-        "missing-balance-check" => {
-            "Reports token transfer calls that lack a preceding balance or authorization check."
-        }
-        "unbounded-vec-growth" => {
-            "Reports storage-backed Vec values pushed and written back without an apparent length cap."
-        }
-        "unsafe-randomness" => {
-            "Reports ledger timestamp or sequence usage as a randomness source."
-        }
-        "unchecked-divisor" => {
-            "Reports division by runtime values without an apparent non-zero guard."
-        }
-        _ => "No detailed explanation is available for this custom check.",
-    }
-}
-
 fn build_fn_spans(file: &syn::File) -> Vec<FnSpan> {
     contractimpl_functions_with_type_excluding_test(file)
         .into_iter()
@@ -240,9 +168,22 @@ fn is_suppressed(finding: &Finding, suppressions: &Suppressions, fn_spans: &[FnS
     ))
 }
 
+/// Drop only findings that are identical in everything a reader would use to tell
+/// them apart. Keying on `(file, line, check_name)` alone collapsed distinct
+/// same-line findings from checks that legitimately report more than once per line
+/// (e.g. one `unchecked-arithmetic` hit per operator).
 fn dedup_findings(findings: &mut Vec<Finding>) {
     let mut seen = HashSet::new();
-    findings.retain(|f| seen.insert((f.file_path.clone(), f.line, f.check_name.clone())));
+    findings.retain(|f| {
+        seen.insert((
+            f.file_path.clone(),
+            f.line,
+            f.check_name.clone(),
+            f.function_name.clone(),
+            f.description.clone(),
+            f.severity,
+        ))
+    });
 }
 
 /// Collect `.rs` paths under `root`, applying exclude/include glob filters and skipping
@@ -812,6 +753,58 @@ mod dedup_tests {
                 lines
             );
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A check that reports two findings at the same `(file, line, check_name)` that
+    /// differ only in their description — the shape produced by per-operator checks
+    /// like `unchecked-arithmetic` on a single source line.
+    struct DistinctSameLineCheck;
+    impl soroban_guard_checks::Check for DistinctSameLineCheck {
+        fn name(&self) -> &str {
+            "distinct-same-line"
+        }
+        fn run(&self, _file: &syn::File, _src: &str) -> Vec<Finding> {
+            let base = Finding {
+                check_name: "distinct-same-line".into(),
+                severity: Severity::Medium,
+                file_path: String::new(),
+                line: 3,
+                function_name: "f".into(),
+                description: String::new(),
+                rule_url: None,
+                suggestion: None,
+            };
+            vec![
+                Finding {
+                    description: "addition may overflow".into(),
+                    ..base.clone()
+                },
+                Finding {
+                    description: "multiplication may overflow".into(),
+                    ..base
+                },
+            ]
+        }
+    }
+
+    #[test]
+    fn keeps_distinct_findings_on_the_same_line() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-dedup-distinct-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let checks: Vec<Box<dyn soroban_guard_checks::Check + Send + Sync>> =
+            vec![Box::new(DistinctSameLineCheck)];
+        let (results, _, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
+
+        let total: usize = results.iter().map(|r| r.findings.len()).sum();
+        assert_eq!(total, 2, "distinct same-line findings must both survive dedup, got {total}");
 
         fs::remove_dir_all(root).unwrap();
     }
