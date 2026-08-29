@@ -93,7 +93,11 @@ impl PanicVisitor<'_> {
                 "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#panic-in-contract-medium"
                     .to_string(),
             ),
-                suggestion: None,
+            suggestion: Some(
+                "Replace with `env.panic_with_error(&MyError::Variant)` or change the \
+                 return type to `Result<T, MyError>` and return `Err(…)` instead."
+                    .to_string(),
+            ),
         });
     }
 }

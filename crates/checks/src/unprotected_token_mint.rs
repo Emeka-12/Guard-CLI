@@ -45,7 +45,10 @@ impl<'ast> Visit<'ast> for MintVisitor {
                                     "Mint/burn method `{}` lacks require_auth call",
                                     name
                                 ),
-                                rule_url: None,
+                                rule_url: Some(
+                                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unprotected-token-mint-high"
+                                        .to_string(),
+                                ),
                                 suggestion: Some(
                                     "Add env.require_auth() to restrict minting to authorized callers"
                                         .to_string(),

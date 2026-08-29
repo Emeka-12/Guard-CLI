@@ -8,7 +8,7 @@ use crate::util::{
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Block, Expr, ExprMethodCall, File};
+use syn::{Block, ExprMethodCall, File};
 
 const CHECK_NAME: &str = "missing-event-emission";
 
@@ -41,8 +41,16 @@ impl Check for MissingEventEmissionCheck {
                     "Method `{fn_name}` writes to storage but does not emit an event. Consider using \
                      `env.events().publish(…)` to allow off-chain indexers to track contract activity."
                 ),
-                rule_url: None,
+                rule_url: Some(
+                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#missing-event-emission-medium"
+                        .to_string(),
+                ),
                 suggestion: None,
+                rule_url: None,
+                suggestion: Some(format!(
+                    "Add `env.events().publish((symbol_short!(\"{fn_name}\"), …), &payload)` \
+                     after the storage write so off-chain indexers can track this state change."
+                )),
             });
         }
         out

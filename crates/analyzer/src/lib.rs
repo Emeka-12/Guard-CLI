@@ -26,78 +26,6 @@ struct FnSpan {
     end_line: usize,
 }
 
-fn explain_details(name: &str) -> &'static str {
-    match name {
-        "missing-require-auth" => {
-            "Reports contract methods that mutate storage without calling require_auth or require_auth_for_args."
-        }
-        "unchecked-arithmetic" => {
-            "Reports wrapping +, -, *, and compound arithmetic in contract methods; prefer checked_* or saturating_* APIs."
-        }
-        "unprotected-admin" => {
-            "Reports public admin-like entrypoints such as set_owner, pause, migrate, or upgrade when they lack an auth gate."
-        }
-        "unsafe-storage-patterns" => {
-            "Reports temporary storage mutations and dynamic Symbol keys that may expire unexpectedly or collide."
-        }
-        "missing-ttl-extension" => {
-            "Reports persistent storage writes that do not extend TTL in the same function."
-        }
-        "forbidden-std-imports" => {
-            "Reports std imports in Soroban contract files because deployable contracts must compile for no_std WASM."
-        }
-        "hardcoded-address" => {
-            "Reports Stellar public-key-shaped string literals embedded directly in source."
-        }
-        "unsafe-cross-contract-input" => {
-            "Reports invoke_contract return values stored directly without local validation."
-        }
-        "missing-contract-annotation" => {
-            "Reports contractimpl blocks without a sibling struct annotated with #[contract]."
-        }
-        "delegate-call-risk" => {
-            "Reports storage-derived cross-contract callees that can redirect execution if storage is poisoned."
-        }
-        "integer-division-truncation" => {
-            "Reports integer division where truncation may silently change financial or accounting results."
-        }
-        "missing-event-emission" => {
-            "Reports state-mutating functions that do not publish events for off-chain indexers."
-        }
-        "symbol-key-collision" => {
-            "Reports duplicate symbol_short! keys in the same impl block."
-        }
-        "self-transfer" => {
-            "Reports transfer-like functions that do not guard against sender and recipient being equal."
-        }
-        "missing-zero-address-check" => {
-            "Reports Address parameters stored or used without checking for default or zero-address values."
-        }
-        "mutable-global-state" => {
-            "Reports static mut items, which are unsafe and not valid persistent contract state."
-        }
-        "re-initialization-risk" => {
-            "Reports initializer-like methods that write state without checking whether initialization already happened."
-        }
-        "unchecked-invoke-return" => {
-            "Reports bare invoke_contract statements whose return values are discarded."
-        }
-        "missing-balance-check" => {
-            "Reports token transfer calls that lack a preceding balance or authorization check."
-        }
-        "unbounded-vec-growth" => {
-            "Reports storage-backed Vec values pushed and written back without an apparent length cap."
-        }
-        "unsafe-randomness" => {
-            "Reports ledger timestamp or sequence usage as a randomness source."
-        }
-        "unchecked-divisor" => {
-            "Reports division by runtime values without an apparent non-zero guard."
-        }
-        _ => "No detailed explanation is available for this custom check.",
-    }
-}
-
 fn build_fn_spans(file: &syn::File) -> Vec<FnSpan> {
     contractimpl_functions_with_type_excluding_test(file)
         .into_iter()
@@ -116,6 +44,11 @@ pub enum ScanError {
     Io(#[from] std::io::Error),
     #[error("Permission denied reading {path}")]
     PermissionDenied { path: PathBuf },
+    #[error("IO error reading {path}: {source}")]
+    IoRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("Failed to parse {path}: {message}")]
     Parse { path: PathBuf, message: String },
     #[error("Check `{check}` panicked on {path}: {message}")]
@@ -238,9 +171,49 @@ fn is_suppressed(finding: &Finding, suppressions: &Suppressions, fn_spans: &[FnS
     ))
 }
 
+/// Drop only findings that are identical in everything a reader would use to tell
+/// them apart. Keying on `(file, line, check_name)` alone collapsed distinct
+/// same-line findings from checks that legitimately report more than once per line
+/// (e.g. one `unchecked-arithmetic` hit per operator).
 fn dedup_findings(findings: &mut Vec<Finding>) {
     let mut seen = HashSet::new();
-    findings.retain(|f| seen.insert((f.file_path.clone(), f.line, f.check_name.clone())));
+    findings.retain(|f| {
+        seen.insert((
+            f.file_path.clone(),
+            f.line,
+            f.check_name.clone(),
+            f.function_name.clone(),
+            f.description.clone(),
+            f.severity,
+        ))
+    });
+}
+
+/// Compile a list of glob source strings into `glob::Pattern`s, surfacing the first
+/// invalid pattern as `ScanError::InvalidGlobPattern`. Shared by the exclude and
+/// include filters so `--include`/`--exclude` stay behaviourally identical.
+fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => compiled.push(pattern),
+            Err(e) => {
+                return Err(ScanError::InvalidGlobPattern {
+                    pattern: p.clone(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+    Ok(compiled)
+}
+
+/// True when any pattern matches the path, tested both against the root-relative
+/// `label` and the full `path` (a pattern like `vendor/**` should match either form).
+fn glob_matches(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
+    patterns
+        .iter()
+        .any(|p| p.matches_path(label) || p.matches_path(path))
 }
 
 /// Compile glob source strings into patterns, surfacing the first invalid one as
@@ -331,10 +304,35 @@ fn collect_rust_paths(
             continue;
         }
         let label = path.strip_prefix(root).unwrap_or(path);
-        match classify_rust_path(path, label, &exclude_patterns, &include_patterns)? {
-            PathVerdict::Scan => paths.push(path.to_path_buf()),
-            PathVerdict::GeneratedSkip => files_skipped += 1,
-            PathVerdict::Reject => {}
+        if glob_matches(&exclude_patterns, label, path) {
+            continue;
+        }
+        if !include_patterns.is_empty() && !glob_matches(&include_patterns, label, path) {
+            continue;
+        }
+        // An unreadable file must not abort the whole scan (a `0600` file in a shared
+        // checkout, a broken symlink, a race with WalkDir's listing). Warn naming the
+        // path and skip it, matching the warn-and-continue precedent for check panics.
+        match has_generated_file_header(path) {
+            Ok(true) => {
+                files_skipped += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let err = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    ScanError::PermissionDenied {
+                        path: path.to_path_buf(),
+                    }
+                } else {
+                    ScanError::IoRead {
+                        path: path.to_path_buf(),
+                        source: e,
+                    }
+                };
+                eprintln!("warning: {err}, skipping file");
+                continue;
+            }
         }
     }
 
@@ -346,7 +344,10 @@ fn run_checks_for_file(
     root: &Path,
     checks: &[Box<dyn Check + Send + Sync>],
 ) -> Result<Vec<Finding>, ScanError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = std::fs::read_to_string(path).map_err(|e| ScanError::IoRead {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     let syn_file = syn::parse_file(&content).map_err(|e| ScanError::Parse {
         path: path.to_path_buf(),
         message: e.to_string(),
@@ -510,21 +511,17 @@ pub fn scan_files(
 ) -> Result<(Vec<Finding>, usize, usize), ScanError> {
     let root = root.canonicalize()?;
     let exclude_patterns = compile_globs(excludes)?;
-    let include_patterns = compile_globs(includes)?;
 
-    let mut selected: Vec<PathBuf> = Vec::new();
-    let mut files_skipped = 0;
-    for path in paths {
-        let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
-        match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns)? {
-            PathVerdict::Scan => selected.push(path_canon),
-            PathVerdict::GeneratedSkip => files_skipped += 1,
-            PathVerdict::Reject => {}
-        }
-    }
+    let filtered: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|path| {
+            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
+            !glob_matches(&exclude_patterns, label, &path_canon)
+        })
+        .collect();
 
-    let files_scanned = selected.len();
+    let files_scanned = filtered.len();
     let checks = default_checks();
 
     let mut findings: Vec<Finding> = selected
@@ -685,6 +682,59 @@ mod tests {
             scan_files(&[included], &root, &[], &["src/other*.rs".to_string()]).unwrap();
         assert_eq!(files_scanned, 0);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One unreadable `.rs` file must not abort the scan: findings for the readable
+    /// files are still returned. Unix-only (relies on POSIX mode bits); skipped when
+    /// running as root, where the mode bits do not deny access.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_does_not_abort_scan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-unreadable-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let readable = root.join("src/readable.rs");
+        fs::write(
+            &readable,
+            "#[contract]\npub struct C;\n#[contractimpl]\nimpl C {\n    pub fn bump(env: Env) {\n        env.storage().instance().set(&1u32, &2u32);\n    }\n}\n",
+        )
+        .unwrap();
+
+        let unreadable = root.join("src/unreadable.rs");
+        fs::write(&unreadable, "pub fn secret() {}").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // If the process can still read the file (running as root), the scenario
+        // under test does not exist; skip rather than assert a false negative.
+        if fs::read_to_string(&unreadable).is_ok() {
+            let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+            fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+
+        let (findings, files_scanned, _) = scan_directory(&root, &[], &[]).unwrap();
+        assert_eq!(
+            files_scanned, 1,
+            "the readable file should still be scanned"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.check_name == "missing-require-auth"),
+            "expected a finding from the readable file, got {findings:?}"
+        );
+
+        let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1004,6 +1054,58 @@ mod dedup_tests {
                 lines
             );
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A check that reports two findings at the same `(file, line, check_name)` that
+    /// differ only in their description — the shape produced by per-operator checks
+    /// like `unchecked-arithmetic` on a single source line.
+    struct DistinctSameLineCheck;
+    impl soroban_guard_checks::Check for DistinctSameLineCheck {
+        fn name(&self) -> &str {
+            "distinct-same-line"
+        }
+        fn run(&self, _file: &syn::File, _src: &str) -> Vec<Finding> {
+            let base = Finding {
+                check_name: "distinct-same-line".into(),
+                severity: Severity::Medium,
+                file_path: String::new(),
+                line: 3,
+                function_name: "f".into(),
+                description: String::new(),
+                rule_url: None,
+                suggestion: None,
+            };
+            vec![
+                Finding {
+                    description: "addition may overflow".into(),
+                    ..base.clone()
+                },
+                Finding {
+                    description: "multiplication may overflow".into(),
+                    ..base
+                },
+            ]
+        }
+    }
+
+    #[test]
+    fn keeps_distinct_findings_on_the_same_line() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-dedup-distinct-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let checks: Vec<Box<dyn soroban_guard_checks::Check + Send + Sync>> =
+            vec![Box::new(DistinctSameLineCheck)];
+        let (results, _, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
+
+        let total: usize = results.iter().map(|r| r.findings.len()).sum();
+        assert_eq!(total, 2, "distinct same-line findings must both survive dedup, got {total}");
 
         fs::remove_dir_all(root).unwrap();
     }
