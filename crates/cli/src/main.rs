@@ -679,7 +679,7 @@ fn describe_check(name: &str) -> (&'static str, &'static str) {
         "unchecked-token-amount" => ("medium", "Flags token amounts used without validation"),
         "large-loop" => ("medium", "Flags loops over unbounded collections"),
         "missing-nonce" => ("medium", "Flags functions susceptible to replay attacks"),
-        "uninitialized-storage-read" => ("medium", "Flags storage reads without initialization checks"),
+        "uninitialized-storage-read" => ("high", "Flags storage reads without initialization checks"),
         "missing-event-for-admin-change" => ("medium", "Flags admin changes with no event emission"),
         "missing-input-length-bound" => ("medium", "Flags input collections without length bound checks"),
         "auth-after-storage-write" => ("high", "Flags authorization checks after storage writes"),
@@ -1186,6 +1186,43 @@ mod tests {
         for check in default_checks() {
             let desc = describe_rule(check.name());
             assert_ne!(desc, "Custom check", "check {} has fallback rule description", check.name());
+        }
+    }
+
+    /// `describe_check`'s severity must match the severity `docs/checks.md` documents
+    /// for the same check (the `## \`name\` (Severity)` header). This is the drift that
+    /// let `uninitialized-storage-read` report `medium` while the check emits `High`.
+    #[test]
+    fn describe_check_severity_matches_docs() {
+        let docs = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/checks.md"
+        ))
+        .expect("docs/checks.md should be readable from the workspace");
+
+        let mut documented: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for line in docs.lines() {
+            let Some(rest) = line.strip_prefix("## `") else { continue };
+            let Some((name, tail)) = rest.split_once('`') else { continue };
+            let Some(sev) = tail.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+                continue;
+            };
+            documented.insert(name.to_string(), sev.to_ascii_lowercase());
+        }
+
+        for check in default_checks() {
+            let name = check.name();
+            // Inherently multi-severity: `infer_severity` picks High/Medium/Low per call site.
+            if name == "unchecked-arithmetic" {
+                continue;
+            }
+            let Some(doc_sev) = documented.get(name) else { continue };
+            let (table_sev, _) = describe_check(name);
+            assert_eq!(
+                table_sev, doc_sev,
+                "describe_check says `{table_sev}` for `{name}` but docs/checks.md says `{doc_sev}`"
+            );
         }
     }
 }
