@@ -5,26 +5,17 @@ use soroban_sdk::{contract, contractimpl, symbol_short, Env};
 pub struct PanicVulnerable;
 
 #[contractimpl]
-impl DelegateSafe {
-    /// ✅ The callee address comes from the caller, not from storage.
-    /// No delegate-call-risk finding should be produced.
-    pub fn forward(env: Env, callee: Address) {
-        env.invoke_contract::<()>(
-            &callee,
-            &symbol_short!("ping"),
-            soroban_sdk::vec![&env],
-        );
-    }
-}
-
-
-#[contractimpl]
 impl PanicVulnerable {
-    /// Uses unwrap() — should trigger `panic-in-contract` (Medium).
-    pub fn get_value(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get::<_, u32>(&symbol_short!("val"))
-            .unwrap() // ❌ panics with unhelpful error if key is absent
+    /// Uses panic!() directly — triggers `panic-in-contract`.
+    pub fn force(_env: Env, flag: bool) -> u32 {
+        if flag {
+            panic!("flag is set");
+        }
+        0
+    }
+
+    /// Uses unwrap() on a non-storage Option — triggers `panic-in-contract`.
+    pub fn get_value(_env: Env, maybe: Option<u32>) -> u32 {
+        maybe.unwrap()
     }
 }
