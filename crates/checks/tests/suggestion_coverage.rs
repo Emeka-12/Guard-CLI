@@ -491,7 +491,7 @@ fn unprotected_upgrade_has_suggestion() {
 #[contractimpl]
 impl C {
     pub fn upgrade(env: Env, new_code: Bytes) {
-        env.deployer().upload_contract_wasm(&new_code);
+        env.invoke_wasm(&new_code);
     }
 }
 "#,
