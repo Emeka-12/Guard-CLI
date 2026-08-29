@@ -24,10 +24,35 @@ impl Check for UninitializedStorageReadCheck {
         let mut out = Vec::new();
         for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
-            let mut v = StorageReadVisitor { fn_name, out: &mut out };
+            let mut v = StorageReadVisitor {
+                fn_name,
+                block: &method.block,
+                out: &mut out,
+            };
             v.visit_block(&method.block);
         }
         out
+    }
+}
+
+fn block_has_storage_has_guard(block: &syn::Block) -> bool {
+    let mut v = StorageHasGuardVisitor::default();
+    v.visit_block(block);
+    v.found
+}
+
+#[derive(Default)]
+struct StorageHasGuardVisitor {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for StorageHasGuardVisitor {
+    fn visit_expr_method_call(&mut self, i: &'ast ExprMethodCall) {
+        if i.method == "has" && receiver_chain_contains_storage(&i.receiver) {
+            self.found = true;
+            return;
+        }
+        visit::visit_expr_method_call(self, i);
     }
 }
 
@@ -47,6 +72,7 @@ fn is_storage_get(expr: &Expr) -> bool {
 
 struct StorageReadVisitor<'a> {
     fn_name: String,
+    block: &'a syn::Block,
     out: &'a mut Vec<Finding>,
 }
 
@@ -54,7 +80,10 @@ impl Visit<'_> for StorageReadVisitor<'_> {
     fn visit_expr_method_call(&mut self, i: &ExprMethodCall) {
         let method = i.method.to_string();
         // Flag `.unwrap()` or `.expect(…)` chained directly onto a storage `.get(…)` call.
-        if (method == "unwrap" || method == "expect") && is_storage_get(&i.receiver) {
+        if (method == "unwrap" || method == "expect")
+            && is_storage_get(&i.receiver)
+            && !block_has_storage_has_guard(self.block)
+        {
             self.out.push(Finding {
                 check_name: CHECK_NAME.to_string(),
                 severity: Severity::High,

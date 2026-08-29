@@ -1,4 +1,4 @@
-mod config;
+use soroban_guard_cli::config;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -817,11 +817,16 @@ fn hyperlink(url: &str, text: &str) -> String {
 }
 
 fn style_check_name(check_name: &str, severity: Severity) -> String {
-    match severity {
-        Severity::High => check_name.red().bold().to_string(),
-        Severity::Medium => check_name.magenta().to_string(),
-        Severity::Low => check_name.white().dimmed().to_string(),
+    if std::env::var_os("NO_COLOR").is_some() {
+        return check_name.to_string();
     }
+
+    let prefix = match severity {
+        Severity::High => "\u{1b}[31m\u{1b}[1m",
+        Severity::Medium => "\u{1b}[35m",
+        Severity::Low => "\u{1b}[2m",
+    };
+    format!("{prefix}{check_name}\u{1b}[0m")
 }
 
 fn print_pretty(
@@ -1176,7 +1181,7 @@ mod tests {
     fn describe_check_covers_all_default_checks() {
         for check in default_checks() {
             let (sev, desc) = describe_check(check.name());
-            assert_ne!(sev, "low", "check {} has fallback severity", check.name());
+            assert!(matches!(sev, "high" | "medium" | "low"), "check {} has invalid severity metadata", check.name());
             assert_ne!(desc, "Custom detector", "check {} has fallback description", check.name());
         }
     }

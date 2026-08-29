@@ -1,9 +1,11 @@
 use soroban_guard_analyzer::scan_directory;
+use soroban_guard_cli::config;
 use std::path::PathBuf;
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
+        .join("..")
+        .join("..")
         .join("test-contracts")
         .join(name)
 }

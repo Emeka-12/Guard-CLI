@@ -249,6 +249,22 @@ pub fn default_checks() -> Vec<Box<dyn Check + Send + Sync>> {
     all_checks_base()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{default_checks, default_checks_with_config};
+
+    #[test]
+    fn default_and_configured_check_lists_share_same_names() {
+        let default_names: Vec<_> = default_checks().iter().map(|check| check.name().to_string()).collect();
+        let configured_names: Vec<_> = default_checks_with_config(&[], &[])
+            .iter()
+            .map(|check| check.name().to_string())
+            .collect();
+
+        assert_eq!(default_names, configured_names);
+    }
+}
+
 /// Like [`default_checks`] but applies config-file settings:
 /// - `disabled`: check names to omit
 /// - `extra_sensitive_names`: extra names added to `UnprotectedAdminCheck`
@@ -256,43 +272,12 @@ pub fn default_checks_with_config(
     disabled: &[String],
     extra_sensitive_names: &[String],
 ) -> Vec<Box<dyn Check + Send + Sync>> {
-    let mut checks: Vec<Box<dyn Check + Send + Sync>> = vec![
-        Box::new(MissingRequireAuthCheck),
-        Box::new(AuthAfterStorageWriteCheck),
-        Box::new(UncheckedArithmeticCheck),
-        Box::new(UnprotectedAdminCheck::with_extra_names(extra_sensitive_names.to_vec())),
-        Box::new(UnsafeStoragePatternsCheck),
-        Box::new(MissingTtlExtensionCheck),
-        Box::new(ForbiddenStdImportsCheck),
-        Box::new(HardcodedAddressCheck),
-        Box::new(UnsafeCrossContractInputCheck),
-        Box::new(MissingContractAnnotationCheck),
-        Box::new(DelegateCallRiskCheck),
-        Box::new(IntegerDivisionTruncationCheck),
-        Box::new(MissingEventEmissionCheck),
-        Box::new(SymbolKeyCollisionCheck),
-        Box::new(SelfTransferCheck),
-        Box::new(MissingZeroAddressCheck),
-        Box::new(MutableGlobalStateCheck),
-        Box::new(ReInitializationRiskCheck),
-        Box::new(UncheckedInvokeReturnCheck),
-        Box::new(MissingBalanceCheck),
-        Box::new(UnboundedVecGrowthCheck),
-        Box::new(UnsafeRandomnessCheck),
-        Box::new(UncheckedDivisorCheck),
-        Box::new(PanicInContractCheck),
-        Box::new(UnprotectedUpgradeCheck),
-        Box::new(UnprotectedTokenMintCheck),
-        Box::new(UnprotectedContractDeploymentCheck),
-        Box::new(UncheckedTokenAmountCheck),
-        Box::new(LargeLoopCheck),
-        Box::new(MissingNonceCheck),
-        Box::new(UninitializedStorageReadCheck),
-        Box::new(ReentrancyRiskCheck),
-        Box::new(AuthAfterStorageWriteCheck),
-        Box::new(MissingEventForAdminChangeCheck),
-        Box::new(MissingInputLengthBoundCheck),
-    ];
+    let mut checks = all_checks_base();
+    for check in &mut checks {
+        if check.name() == UnprotectedAdminCheck::new().name() {
+            *check = Box::new(UnprotectedAdminCheck::with_extra_names(extra_sensitive_names.to_vec()));
+        }
+    }
     checks.retain(|c| !disabled.contains(&c.name().to_string()));
     checks
 }
