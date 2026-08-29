@@ -37,8 +37,11 @@ impl Check for SymbolKeyCollisionCheck {
                                 line: *line,
                                 function_name: String::new(),
                                 description: format!(
-                                    "Duplicate symbol key `{}` found at position {}",
-                                    key, pos
+                                    "Duplicate symbol key `{}` found again at line {}, column {} \
+                                     — this key is already used elsewhere in the same impl block.",
+                                    key,
+                                    line,
+                                    pos + 1
                                 ),
                                 rule_url: None,
                                 suggestion: None,
