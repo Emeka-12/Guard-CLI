@@ -113,7 +113,12 @@ impl<'ast> Visit<'ast> for XcInputVisitor<'ast> {
                                 "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unsafe-cross-contract-input-high"
                                     .to_string(),
                             ),
-                            suggestion: None,
+                            suggestion: Some(
+                                "Validate or sanitize the `invoke_contract` return value before \
+                                 storing it — e.g. bounds-check numeric results or match on an \
+                                 expected type/variant before calling `env.storage().*.set(…)`."
+                                    .to_string(),
+                            ),
                         });
                     }
                 }

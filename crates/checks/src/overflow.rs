@@ -169,7 +169,11 @@ impl Visit<'_> for ArithVisitor<'_> {
                     "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unchecked-arithmetic"
                         .to_string(),
                 ),
-                suggestion: None,
+                suggestion: Some(format!(
+                    "Replace `{op}` with `checked_add`/`checked_sub`/`checked_mul` and \
+                     handle overflow explicitly, or use `saturating_add`/`saturating_sub` \
+                     if saturating semantics are acceptable."
+                )),
             });
         }
         visit::visit_expr_binary(self, i);

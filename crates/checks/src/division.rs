@@ -68,7 +68,11 @@ impl Visit<'_> for DivVisitor<'_> {
                     "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#integer-division-truncation-medium"
                         .to_string(),
                 ),
-                suggestion: None,
+                suggestion: Some(
+                    "Use `checked_div` and handle the `None` case, or document the rounding \
+                     direction explicitly (e.g. floor vs. ceiling) with a comment."
+                        .to_string(),
+                ),
             });
         }
         visit::visit_expr_binary(self, i);

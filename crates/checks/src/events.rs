@@ -46,6 +46,11 @@ impl Check for MissingEventEmissionCheck {
                         .to_string(),
                 ),
                 suggestion: None,
+                rule_url: None,
+                suggestion: Some(format!(
+                    "Add `env.events().publish((symbol_short!(\"{fn_name}\"), …), &payload)` \
+                     after the storage write so off-chain indexers can track this state change."
+                )),
             });
         }
         out

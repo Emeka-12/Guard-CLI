@@ -48,6 +48,12 @@ impl Check for SymbolKeyCollisionCheck {
                                 .to_string(),
                         ),
                         suggestion: None,
+                        rule_url: None,
+                        suggestion: Some(format!(
+                            "Rename one of the duplicate `symbol_short!(\"{key}\")` / \
+                             `Symbol::new(…, \"{key}\")` usages to a unique key to avoid \
+                             accidental storage slot collisions."
+                        )),
                     });
                 }
             }
