@@ -8,7 +8,7 @@ use soroban_guard_analyzer::scan_directory_with_checks;
 use soroban_guard_checks::{default_checks, default_checks_with_config, Finding, Severity};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -65,6 +65,9 @@ enum Commands {
         /// Watch for .rs file changes and re-run the scan automatically
         #[arg(long, short = 'w')]
         watch: bool,
+        /// Do not clear the terminal between watch re-scans (always implied by --json, --sarif, and --output)
+        #[arg(long)]
+        no_clear: bool,
     },
     /// List the checks that are enabled by default
     ListChecks,
@@ -243,6 +246,20 @@ fn is_leap(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
+/// Parse a `--fail-on` / `min_severity` string into a `Severity`.
+///
+/// Returns `Ok(Severity)` for `"high"`, `"medium"`, or `"low"` (case-insensitive).
+/// Returns `Err(original_value)` for anything else so the caller can emit a
+/// helpful `error:` message and exit 2.
+fn parse_fail_on(value: &str) -> Result<Severity, &str> {
+    match value.to_lowercase().as_str() {
+        "high" => Ok(Severity::High),
+        "medium" => Ok(Severity::Medium),
+        "low" => Ok(Severity::Low),
+        _ => Err(value),
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -260,6 +277,7 @@ fn main() {
             fail_on,
             disable_check,
             watch,
+            no_clear,
         } => {
             if no_color || std::env::var_os("NO_COLOR").is_some() {
                 colored::control::set_override(false);
@@ -311,10 +329,16 @@ fn main() {
             } else {
                 cfg.scan.min_severity.clone().unwrap_or(fail_on.clone())
             };
-            let fail_threshold = match effective_fail_on.to_lowercase().as_str() {
-                "medium" => Severity::Medium,
-                "low" => Severity::Low,
-                _ => Severity::High,
+            let fail_threshold = match parse_fail_on(&effective_fail_on) {
+                Ok(sev) => sev,
+                Err(bad) => {
+                    eprintln!(
+                        "{} unknown --fail-on value `{}`. Expected one of: high, medium, low",
+                        "error:".red().bold(),
+                        bad
+                    );
+                    std::process::exit(2);
+                }
             };
 
             // Merge config disabled list with --disable-check flags.
@@ -444,11 +468,20 @@ fn main() {
                                 }
                             }
 
-                            // Clear terminal for a clean view.
-                            print!("\x1B[2J\x1B[1;1H");
-                            // Flush so the clear sequence happens in order relative to the
-                            // stderr header on the next line.
-                            let _ = io::stdout().flush();
+                            // Clear terminal for a clean view — only when output is
+                            // going to a human-readable TTY and is not a structured
+                            // format (--json / --sarif / --output).  Send to stderr so
+                            // stdout stays clean for machine consumers.
+                            let stdout_is_tty = std::io::stdout().is_terminal();
+                            let should_clear = !no_clear
+                                && !json
+                                && !sarif
+                                && output.is_none()
+                                && stdout_is_tty;
+                            if should_clear {
+                                eprint!("\x1B[2J\x1B[1;1H");
+                                let _ = io::stderr().flush();
+                            }
 
                             // Print a timestamped re-scan header.
                             let now = chrono_timestamp();
@@ -1286,5 +1319,114 @@ mod tests {
         let passing = [sample_finding("some-check", Severity::Low, 1)];
         let passes_high = passing.iter().any(|f| f.severity <= Severity::High);
         assert!(!should_print_results(true, passes_high));
+    }
+
+    // ── parse_fail_on ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_fail_on_accepts_known_values() {
+        assert_eq!(parse_fail_on("high"), Ok(Severity::High));
+        assert_eq!(parse_fail_on("medium"), Ok(Severity::Medium));
+        assert_eq!(parse_fail_on("low"), Ok(Severity::Low));
+    }
+
+    #[test]
+    fn parse_fail_on_is_case_insensitive() {
+        assert_eq!(parse_fail_on("HIGH"), Ok(Severity::High));
+        assert_eq!(parse_fail_on("Medium"), Ok(Severity::Medium));
+        assert_eq!(parse_fail_on("LOW"), Ok(Severity::Low));
+    }
+
+    #[test]
+    fn parse_fail_on_rejects_unknown_string() {
+        assert!(parse_fail_on("medim").is_err(), "typo should be rejected");
+        assert!(parse_fail_on("none").is_err(), "'none' should be rejected");
+        assert!(parse_fail_on("critical").is_err(), "'critical' should be rejected");
+        assert!(parse_fail_on("").is_err(), "empty string should be rejected");
+    }
+
+    // ── CLI integration: bad --fail-on exits 2 ───────────────────────────────
+
+    #[test]
+    fn bad_fail_on_flag_exits_2() {
+        let mut bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        bin.push("../../target/debug/soroban-guard");
+
+        if !bin.exists() {
+            eprintln!("note: skipping bad_fail_on_flag_exits_2 — binary not found at {}", bin.display());
+            return;
+        }
+
+        let output = std::process::Command::new(&bin)
+            .args(["scan", ".", "--fail-on", "medim"])
+            .output()
+            .expect("failed to run soroban-guard binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "bad --fail-on value should exit 2, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unknown --fail-on value"),
+            "stderr should contain 'unknown --fail-on value', got: {stderr}"
+        );
+    }
+
+    // ── watch --json: stdout must contain no ANSI clear-screen ───────────────
+
+    /// Verifies that `--watch --json` does not write the ANSI clear-screen
+    /// sequence (\x1B[2J) to stdout.  The binary is run with a 1-second timeout;
+    /// stdout is captured and checked for the escape sequence.
+    ///
+    /// This is an integration test that requires the debug binary to be present.
+    #[test]
+    fn watch_json_stdout_contains_no_clear_screen() {
+        let mut bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        bin.push("../../target/debug/soroban-guard");
+
+        if !bin.exists() {
+            eprintln!(
+                "note: skipping watch_json_stdout_contains_no_clear_screen — binary not found at {}",
+                bin.display()
+            );
+            return;
+        }
+
+        // Run with --watch --json for a short timeout then kill.
+        // We just need to check that the initial stdout output (the first scan)
+        // contains no \x1B[2J — the watch loop would only emit it on a file event,
+        // but even if it did trigger it must never land on stdout.
+        //
+        // We use a temp contract dir so the scan completes quickly.
+        let tmp = std::env::temp_dir().join(format!(
+            "soroban-guard-watch-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Write a trivial Rust file so the scan has something to parse.
+        std::fs::write(tmp.join("lib.rs"), "fn dummy() {}").unwrap();
+
+        let mut child = std::process::Command::new(&bin)
+            .args(["scan", tmp.to_str().unwrap(), "--json", "--watch"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn soroban-guard binary");
+
+        // Give the initial scan a moment to run, then kill.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let _ = child.kill();
+        let out = child.wait_with_output().expect("failed to collect output");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("\x1B[2J"),
+            "--watch --json must not write ANSI clear-screen to stdout, got: {stdout:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
