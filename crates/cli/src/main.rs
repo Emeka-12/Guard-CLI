@@ -243,6 +243,20 @@ fn is_leap(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
+/// Parse a `--fail-on` / `min_severity` string into a `Severity`.
+///
+/// Returns `Ok(Severity)` for `"high"`, `"medium"`, or `"low"` (case-insensitive).
+/// Returns `Err(original_value)` for anything else so the caller can emit a
+/// helpful `error:` message and exit 2.
+fn parse_fail_on(value: &str) -> Result<Severity, &str> {
+    match value.to_lowercase().as_str() {
+        "high" => Ok(Severity::High),
+        "medium" => Ok(Severity::Medium),
+        "low" => Ok(Severity::Low),
+        _ => Err(value),
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -311,10 +325,16 @@ fn main() {
             } else {
                 cfg.scan.min_severity.clone().unwrap_or(fail_on.clone())
             };
-            let fail_threshold = match effective_fail_on.to_lowercase().as_str() {
-                "medium" => Severity::Medium,
-                "low" => Severity::Low,
-                _ => Severity::High,
+            let fail_threshold = match parse_fail_on(&effective_fail_on) {
+                Ok(sev) => sev,
+                Err(bad) => {
+                    eprintln!(
+                        "{} unknown --fail-on value `{}`. Expected one of: high, medium, low",
+                        "error:".red().bold(),
+                        bad
+                    );
+                    std::process::exit(2);
+                }
             };
 
             // Merge config disabled list with --disable-check flags.
@@ -1286,5 +1306,61 @@ mod tests {
         let passing = [sample_finding("some-check", Severity::Low, 1)];
         let passes_high = passing.iter().any(|f| f.severity <= Severity::High);
         assert!(!should_print_results(true, passes_high));
+    }
+
+    // ── parse_fail_on ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_fail_on_accepts_known_values() {
+        assert_eq!(parse_fail_on("high"), Ok(Severity::High));
+        assert_eq!(parse_fail_on("medium"), Ok(Severity::Medium));
+        assert_eq!(parse_fail_on("low"), Ok(Severity::Low));
+    }
+
+    #[test]
+    fn parse_fail_on_is_case_insensitive() {
+        assert_eq!(parse_fail_on("HIGH"), Ok(Severity::High));
+        assert_eq!(parse_fail_on("Medium"), Ok(Severity::Medium));
+        assert_eq!(parse_fail_on("LOW"), Ok(Severity::Low));
+    }
+
+    #[test]
+    fn parse_fail_on_rejects_unknown_string() {
+        assert!(parse_fail_on("medim").is_err(), "typo should be rejected");
+        assert!(parse_fail_on("none").is_err(), "'none' should be rejected");
+        assert!(parse_fail_on("critical").is_err(), "'critical' should be rejected");
+        assert!(parse_fail_on("").is_err(), "empty string should be rejected");
+    }
+
+    // ── CLI integration: bad --fail-on exits 2 ───────────────────────────────
+
+    #[test]
+    fn bad_fail_on_flag_exits_2() {
+        // Build the binary path relative to the workspace root.
+        let mut bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        bin.push("../../target/debug/soroban-guard");
+
+        // If the binary hasn't been built yet, skip rather than panic.
+        if !bin.exists() {
+            eprintln!("note: skipping bad_fail_on_flag_exits_2 — binary not found at {}", bin.display());
+            return;
+        }
+
+        let output = std::process::Command::new(&bin)
+            .args(["scan", ".", "--fail-on", "medim"])
+            .output()
+            .expect("failed to run soroban-guard binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "bad --fail-on value should exit 2, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unknown --fail-on value"),
+            "stderr should contain 'unknown --fail-on value', got: {stderr}"
+        );
     }
 }

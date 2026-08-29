@@ -189,25 +189,6 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
     });
 }
 
-/// Compile a list of glob source strings into `glob::Pattern`s, surfacing the first
-/// invalid pattern as `ScanError::InvalidGlobPattern`. Shared by the exclude and
-/// include filters so `--include`/`--exclude` stay behaviourally identical.
-fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
-    let mut compiled = Vec::with_capacity(patterns.len());
-    for p in patterns {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => compiled.push(pattern),
-            Err(e) => {
-                return Err(ScanError::InvalidGlobPattern {
-                    pattern: p.clone(),
-                    reason: e.to_string(),
-                })
-            }
-        }
-    }
-    Ok(compiled)
-}
-
 /// True when any pattern matches the path, tested both against the root-relative
 /// `label` and the full `path` (a pattern like `vendor/**` should match either form).
 fn glob_matches(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
@@ -511,20 +492,33 @@ pub fn scan_files(
 ) -> Result<(Vec<Finding>, usize, usize), ScanError> {
     let root = root.canonicalize()?;
     let exclude_patterns = compile_globs(excludes)?;
+    let include_patterns = compile_globs(includes)?;
 
-    let filtered: Vec<&PathBuf> = paths
+    let mut files_skipped = 0usize;
+    let filtered: Vec<PathBuf> = paths
         .iter()
-        .filter(|path| {
+        .filter_map(|path| {
             let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
-            !glob_matches(&exclude_patterns, label, &path_canon)
+            match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns) {
+                Ok(PathVerdict::Scan) => Some(path_canon),
+                Ok(PathVerdict::GeneratedSkip) => {
+                    files_skipped += 1;
+                    None
+                }
+                Ok(PathVerdict::Reject) => None,
+                Err(e) => {
+                    eprintln!("warning: {e}, skipping file");
+                    None
+                }
+            }
         })
         .collect();
 
     let files_scanned = filtered.len();
     let checks = default_checks();
 
-    let mut findings: Vec<Finding> = selected
+    let mut findings: Vec<Finding> = filtered
         .par_iter()
         .map(|path| run_checks_for_file(path, &root, &checks))
         .collect::<Result<Vec<Vec<Finding>>, ScanError>>()?
