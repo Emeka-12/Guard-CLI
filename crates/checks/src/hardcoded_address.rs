@@ -1,6 +1,7 @@
 //! Hardcoded Stellar public-key strings (`G...`, 56 chars) baked into contract source.
 
 use crate::{Check, Finding, Severity};
+use syn::spanned::Spanned;
 use syn::File;
 
 const CHECK_NAME: &str = "hardcoded-address";
@@ -16,16 +17,22 @@ impl Check for HardcodedAddressCheck {
         CHECK_NAME
     }
 
-    fn run(&self, _file: &File, source: &str) -> Vec<Finding> {
+    fn run(&self, file: &File, source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for (idx, line) in source.lines().enumerate() {
-            for key in find_candidate_keys(line) {
+        let spans = function_spans(file);
+        for (idx, line) in effective_lines(source).into_iter().enumerate() {
+            let raw_line = source.lines().nth(idx).unwrap_or("");
+            if raw_line.trim_start().starts_with("#[doc") {
+                continue;
+            }
+            for key in find_candidate_keys(&line) {
+                let line_no = idx + 1;
                 out.push(Finding {
                     check_name: CHECK_NAME.to_string(),
                     severity: Severity::Medium,
                     file_path: String::new(),
-                    line: idx + 1,
-                    function_name: "module".to_string(),
+                    line: line_no,
+                    function_name: enclosing_function(&spans, line_no).to_string(),
                     description: format!(
                         "String literal `{key}` looks like a hardcoded Stellar public key. \
                          Pass addresses in as contract parameters or configuration instead of \
@@ -48,6 +55,74 @@ impl Check for HardcodedAddressCheck {
 
 fn is_strkey_char(b: u8) -> bool {
     b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)
+}
+
+/// Returns the enclosing `#[contractimpl]` method name for a given source line, or
+/// `"module"` if the line falls outside any such method.
+fn enclosing_function(spans: &[(usize, usize, String)], line: usize) -> &str {
+    spans
+        .iter()
+        .find(|(start, end, _)| line >= *start && line <= *end)
+        .map(|(_, _, name)| name.as_str())
+        .unwrap_or("module")
+}
+
+/// Line-range/name triples for every `#[contractimpl]` method in the file.
+fn function_spans(file: &File) -> Vec<(usize, usize, String)> {
+    crate::util::contractimpl_functions(file)
+        .into_iter()
+        .map(|m| {
+            let start = m.span().start().line;
+            let end = m.span().end().line;
+            (start, end, m.sig.ident.to_string())
+        })
+        .collect()
+}
+
+/// Strips `//` and `/* ... */` comments from each line (block comments may span lines), so
+/// keys that only appear in a comment aren't reported as real string literals.
+fn effective_lines(source: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(source.lines().count());
+    let mut in_block_comment = false;
+    for line in source.lines() {
+        let mut effective = String::new();
+        let mut rest = line;
+        loop {
+            if in_block_comment {
+                match rest.find("*/") {
+                    Some(end) => {
+                        rest = &rest[end + 2..];
+                        in_block_comment = false;
+                    }
+                    None => break,
+                }
+            } else {
+                let line_comment = rest.find("//");
+                let block_comment = rest.find("/*");
+                match (line_comment, block_comment) {
+                    (Some(lc), Some(bc)) if lc < bc => {
+                        effective.push_str(&rest[..lc]);
+                        break;
+                    }
+                    (Some(lc), _) if block_comment.is_none() => {
+                        effective.push_str(&rest[..lc]);
+                        break;
+                    }
+                    (_, Some(bc)) => {
+                        effective.push_str(&rest[..bc]);
+                        rest = &rest[bc + 2..];
+                        in_block_comment = true;
+                    }
+                    (None, None) => {
+                        effective.push_str(rest);
+                        break;
+                    }
+                }
+            }
+        }
+        out.push(effective);
+    }
+    out
 }
 
 /// Finds `G`-prefixed, 56-char base32 runs on a line that aren't part of a larger identifier.
