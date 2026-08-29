@@ -41,7 +41,7 @@ enum Commands {
         /// Write output to a file instead of stdout (applies to --json, --sarif, and --markdown)
         #[arg(long)]
         output: Option<PathBuf>,
-        /// Suppress all output when there are zero High findings
+        /// Suppress all output unless a finding meets the --fail-on threshold
         #[arg(long)]
         quiet: bool,
         /// Disable colored output
@@ -96,6 +96,13 @@ struct ScanOptions {
     includes: Vec<String>,
 }
 
+/// Whether scan results should be printed. `--quiet` suppresses output only while the
+/// run is passing: as soon as a finding meets the `--fail-on` threshold (`should_fail`),
+/// output is shown regardless. The gate is the `--fail-on` threshold, not High severity.
+fn should_print_results(quiet: bool, should_fail: bool) -> bool {
+    !quiet || should_fail
+}
+
 /// Run a single scan and print its results.
 /// Returns the exit code that would normally be passed to `std::process::exit`
 /// (0 = pass, 1 = findings above threshold, 2 = I/O error).
@@ -131,7 +138,7 @@ fn run_scan(
             };
 
             if let Some(result) = structured_payload {
-                if !opts.quiet || should_fail {
+                if should_print_results(opts.quiet, should_fail) {
                     match result {
                         Ok(payload) => {
                             if let Some(ref out_path) = opts.output {
@@ -149,7 +156,7 @@ fn run_scan(
                         }
                     }
                 }
-            } else if !opts.quiet || should_fail {
+            } else if should_print_results(opts.quiet, should_fail) {
                 let (display, truncated) = truncate(&findings, 0);
                 print_pretty(
                     display,
@@ -715,7 +722,7 @@ fn describe_check(name: &str) -> (&'static str, &'static str) {
         "unchecked-token-amount" => ("medium", "Flags token amounts used without validation"),
         "large-loop" => ("medium", "Flags loops over unbounded collections"),
         "missing-nonce" => ("medium", "Flags functions susceptible to replay attacks"),
-        "uninitialized-storage-read" => ("medium", "Flags storage reads without initialization checks"),
+        "uninitialized-storage-read" => ("high", "Flags storage reads without initialization checks"),
         "missing-event-for-admin-change" => ("medium", "Flags admin changes with no event emission"),
         "missing-input-length-bound" => ("medium", "Flags input collections without length bound checks"),
         "auth-after-storage-write" => ("high", "Flags authorization checks after storage writes"),
@@ -1223,5 +1230,61 @@ mod tests {
             let desc = describe_rule(check.name());
             assert_ne!(desc, "Custom check", "check {} has fallback rule description", check.name());
         }
+    }
+
+    /// `describe_check`'s severity must match the severity `docs/checks.md` documents
+    /// for the same check (the `## \`name\` (Severity)` header). This is the drift that
+    /// let `uninitialized-storage-read` report `medium` while the check emits `High`.
+    #[test]
+    fn describe_check_severity_matches_docs() {
+        let docs = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/checks.md"
+        ))
+        .expect("docs/checks.md should be readable from the workspace");
+
+        let mut documented: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for line in docs.lines() {
+            let Some(rest) = line.strip_prefix("## `") else { continue };
+            let Some((name, tail)) = rest.split_once('`') else { continue };
+            let Some(sev) = tail.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+                continue;
+            };
+            documented.insert(name.to_string(), sev.to_ascii_lowercase());
+        }
+
+        for check in default_checks() {
+            let name = check.name();
+            // Inherently multi-severity: `infer_severity` picks High/Medium/Low per call site.
+            if name == "unchecked-arithmetic" {
+                continue;
+            }
+            let Some(doc_sev) = documented.get(name) else { continue };
+            let (table_sev, _) = describe_check(name);
+            assert_eq!(
+                table_sev, doc_sev,
+                "describe_check says `{table_sev}` for `{name}` but docs/checks.md says `{doc_sev}`"
+            );
+        }
+    }
+
+    /// `--quiet` is gated on the `--fail-on` threshold, not on High severity:
+    /// `--quiet --fail-on low` must still print output when only a Low finding exists.
+    #[test]
+    fn quiet_still_prints_when_low_finding_meets_fail_on_low() {
+        let findings = [sample_finding("some-check", Severity::Low, 1)];
+        let fail_threshold = Severity::Low;
+        let should_fail = findings.iter().any(|f| f.severity <= fail_threshold);
+
+        assert!(should_fail, "a Low finding must trip --fail-on low");
+        assert!(
+            should_print_results(true, should_fail),
+            "--quiet must not suppress output once the --fail-on threshold is met"
+        );
+        // And it does stay silent when nothing meets the (default High) threshold.
+        let passing = [sample_finding("some-check", Severity::Low, 1)];
+        let passes_high = passing.iter().any(|f| f.severity <= Severity::High);
+        assert!(!should_print_results(true, passes_high));
     }
 }

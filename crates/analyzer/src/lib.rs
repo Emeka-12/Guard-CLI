@@ -44,6 +44,11 @@ pub enum ScanError {
     Io(#[from] std::io::Error),
     #[error("Permission denied reading {path}")]
     PermissionDenied { path: PathBuf },
+    #[error("IO error reading {path}: {source}")]
+    IoRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("Failed to parse {path}: {message}")]
     Parse { path: PathBuf, message: String },
     #[error("Check `{check}` panicked on {path}: {message}")]
@@ -186,6 +191,33 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
     });
 }
 
+/// Compile a list of glob source strings into `glob::Pattern`s, surfacing the first
+/// invalid pattern as `ScanError::InvalidGlobPattern`. Shared by the exclude and
+/// include filters so `--include`/`--exclude` stay behaviourally identical.
+fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => compiled.push(pattern),
+            Err(e) => {
+                return Err(ScanError::InvalidGlobPattern {
+                    pattern: p.clone(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+    Ok(compiled)
+}
+
+/// True when any pattern matches the path, tested both against the root-relative
+/// `label` and the full `path` (a pattern like `vendor/**` should match either form).
+fn glob_matches(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
+    patterns
+        .iter()
+        .any(|p| p.matches_path(label) || p.matches_path(path))
+}
+
 /// Collect `.rs` paths under `root`, applying exclude/include glob filters and skipping
 /// files that carry a generated-file header. Returns `(paths, files_skipped)` where
 /// `files_skipped` is the count of files omitted due to the generated-file header.
@@ -194,27 +226,8 @@ fn collect_rust_paths(
     excludes: &[String],
     includes: &[String],
 ) -> Result<(Vec<PathBuf>, usize), ScanError> {
-    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
-    for p in excludes {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => exclude_patterns.push(pattern),
-            Err(e) => return Err(ScanError::InvalidGlobPattern {
-                pattern: p.clone(),
-                reason: e.to_string(),
-            }),
-        }
-    }
-
-    let mut include_patterns: Vec<glob::Pattern> = Vec::new();
-    for p in includes {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => include_patterns.push(pattern),
-            Err(e) => return Err(ScanError::InvalidGlobPattern {
-                pattern: p.clone(),
-                reason: e.to_string(),
-            }),
-        }
-    }
+    let exclude_patterns = compile_globs(excludes)?;
+    let include_patterns = compile_globs(includes)?;
 
     if root.is_file() {
         return Ok((vec![root.to_path_buf()], 0));
@@ -237,22 +250,35 @@ fn collect_rust_paths(
             continue;
         }
         let label = path.strip_prefix(root).unwrap_or(path);
-        if exclude_patterns
-            .iter()
-            .any(|p| p.matches_path(label) || p.matches_path(path))
-        {
+        if glob_matches(&exclude_patterns, label, path) {
             continue;
         }
-        if !include_patterns.is_empty()
-            && !include_patterns
-                .iter()
-                .any(|p| p.matches_path(label) || p.matches_path(path))
-        {
+        if !include_patterns.is_empty() && !glob_matches(&include_patterns, label, path) {
             continue;
         }
-        if has_generated_file_header(path)? {
-            files_skipped += 1;
-            continue;
+        // An unreadable file must not abort the whole scan (a `0600` file in a shared
+        // checkout, a broken symlink, a race with WalkDir's listing). Warn naming the
+        // path and skip it, matching the warn-and-continue precedent for check panics.
+        match has_generated_file_header(path) {
+            Ok(true) => {
+                files_skipped += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let err = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    ScanError::PermissionDenied {
+                        path: path.to_path_buf(),
+                    }
+                } else {
+                    ScanError::IoRead {
+                        path: path.to_path_buf(),
+                        source: e,
+                    }
+                };
+                eprintln!("warning: {err}, skipping file");
+                continue;
+            }
         }
         paths.push(path.to_path_buf());
     }
@@ -265,7 +291,10 @@ fn run_checks_for_file(
     root: &Path,
     checks: &[Box<dyn Check + Send + Sync>],
 ) -> Result<Vec<Finding>, ScanError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = std::fs::read_to_string(path).map_err(|e| ScanError::IoRead {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     let syn_file = syn::parse_file(&content).map_err(|e| ScanError::Parse {
         path: path.to_path_buf(),
         message: e.to_string(),
@@ -422,25 +451,14 @@ pub fn scan_files(
     excludes: &[String],
 ) -> Result<(Vec<Finding>, usize), ScanError> {
     let root = root.canonicalize()?;
-    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
-    for p in excludes {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => exclude_patterns.push(pattern),
-            Err(e) => return Err(ScanError::InvalidGlobPattern {
-                pattern: p.clone(),
-                reason: e.to_string(),
-            }),
-        }
-    }
+    let exclude_patterns = compile_globs(excludes)?;
 
     let filtered: Vec<&PathBuf> = paths
         .iter()
         .filter(|path| {
             let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
-            !exclude_patterns
-                .iter()
-                .any(|pat| pat.matches_path(label) || pat.matches_path(&path_canon))
+            !glob_matches(&exclude_patterns, label, &path_canon)
         })
         .collect();
 
@@ -597,6 +615,59 @@ mod tests {
             scan_files(&[excluded], &root, &["src/other.rs".to_string()]).unwrap();
         assert_eq!(files_scanned, 0);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One unreadable `.rs` file must not abort the scan: findings for the readable
+    /// files are still returned. Unix-only (relies on POSIX mode bits); skipped when
+    /// running as root, where the mode bits do not deny access.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_does_not_abort_scan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-unreadable-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let readable = root.join("src/readable.rs");
+        fs::write(
+            &readable,
+            "#[contract]\npub struct C;\n#[contractimpl]\nimpl C {\n    pub fn bump(env: Env) {\n        env.storage().instance().set(&1u32, &2u32);\n    }\n}\n",
+        )
+        .unwrap();
+
+        let unreadable = root.join("src/unreadable.rs");
+        fs::write(&unreadable, "pub fn secret() {}").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // If the process can still read the file (running as root), the scenario
+        // under test does not exist; skip rather than assert a false negative.
+        if fs::read_to_string(&unreadable).is_ok() {
+            let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+            fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+
+        let (findings, files_scanned, _) = scan_directory(&root, &[], &[]).unwrap();
+        assert_eq!(
+            files_scanned, 1,
+            "the readable file should still be scanned"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.check_name == "missing-require-auth"),
+            "expected a finding from the readable file, got {findings:?}"
+        );
+
+        let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
         fs::remove_dir_all(root).unwrap();
     }
 

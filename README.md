@@ -122,7 +122,7 @@ cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --disable-check 
 cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --include 'src/token*.rs' --exclude 'src/proxy.rs'
 ```
 
-Suppress output entirely when there are zero High findings, or print extra scan statistics:
+Suppress output entirely unless a finding meets the `--fail-on` threshold, or print extra scan statistics:
 
 ```bash
 cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --quiet
