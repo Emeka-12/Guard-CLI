@@ -245,6 +245,65 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
     findings.retain(|f| seen.insert((f.file_path.clone(), f.line, f.check_name.clone())));
 }
 
+/// Compile glob source strings into patterns, surfacing the first invalid one as
+/// `ScanError::InvalidGlobPattern`. Shared by every scan entry point so exclude and
+/// include filters compile identically.
+fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => compiled.push(pattern),
+            Err(e) => {
+                return Err(ScanError::InvalidGlobPattern {
+                    pattern: p.clone(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+    Ok(compiled)
+}
+
+/// Result of applying the shared source-file filter to one candidate path.
+enum PathVerdict {
+    /// A `.rs` file that passed every filter and should be scanned.
+    Scan,
+    /// A `.rs` file omitted because it carries a generated-file header.
+    GeneratedSkip,
+    /// Not a `.rs` file, or excluded by an exclude/include glob.
+    Reject,
+}
+
+fn glob_hit(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
+    patterns
+        .iter()
+        .any(|p| p.matches_path(label) || p.matches_path(path))
+}
+
+/// The single filter every scan entry point applies to a candidate source file:
+/// `.rs` extension, exclude globs, include globs (when non-empty), then the
+/// generated-file header check. `label` is the path relative to the scan root.
+fn classify_rust_path(
+    path: &Path,
+    label: &Path,
+    exclude_patterns: &[glob::Pattern],
+    include_patterns: &[glob::Pattern],
+) -> Result<PathVerdict, ScanError> {
+    if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+        return Ok(PathVerdict::Reject);
+    }
+    if glob_hit(exclude_patterns, label, path) {
+        return Ok(PathVerdict::Reject);
+    }
+    if !include_patterns.is_empty() && !glob_hit(include_patterns, label, path) {
+        return Ok(PathVerdict::Reject);
+    }
+    if has_generated_file_header(path)? {
+        return Ok(PathVerdict::GeneratedSkip);
+    }
+    Ok(PathVerdict::Scan)
+}
+
 /// Collect `.rs` paths under `root`, applying exclude/include glob filters and skipping
 /// files that carry a generated-file header. Returns `(paths, files_skipped)` where
 /// `files_skipped` is the count of files omitted due to the generated-file header.
@@ -253,27 +312,8 @@ fn collect_rust_paths(
     excludes: &[String],
     includes: &[String],
 ) -> Result<(Vec<PathBuf>, usize), ScanError> {
-    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
-    for p in excludes {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => exclude_patterns.push(pattern),
-            Err(e) => return Err(ScanError::InvalidGlobPattern {
-                pattern: p.clone(),
-                reason: e.to_string(),
-            }),
-        }
-    }
-
-    let mut include_patterns: Vec<glob::Pattern> = Vec::new();
-    for p in includes {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => include_patterns.push(pattern),
-            Err(e) => return Err(ScanError::InvalidGlobPattern {
-                pattern: p.clone(),
-                reason: e.to_string(),
-            }),
-        }
-    }
+    let exclude_patterns = compile_globs(excludes)?;
+    let include_patterns = compile_globs(includes)?;
 
     if root.is_file() {
         return Ok((vec![root.to_path_buf()], 0));
@@ -292,28 +332,12 @@ fn collect_rust_paths(
         {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
         let label = path.strip_prefix(root).unwrap_or(path);
-        if exclude_patterns
-            .iter()
-            .any(|p| p.matches_path(label) || p.matches_path(path))
-        {
-            continue;
+        match classify_rust_path(path, label, &exclude_patterns, &include_patterns)? {
+            PathVerdict::Scan => paths.push(path.to_path_buf()),
+            PathVerdict::GeneratedSkip => files_skipped += 1,
+            PathVerdict::Reject => {}
         }
-        if !include_patterns.is_empty()
-            && !include_patterns
-                .iter()
-                .any(|p| p.matches_path(label) || p.matches_path(path))
-        {
-            continue;
-        }
-        if has_generated_file_header(path)? {
-            files_skipped += 1;
-            continue;
-        }
-        paths.push(path.to_path_buf());
     }
 
     Ok((paths, files_skipped))
@@ -470,43 +494,42 @@ pub fn scan_directory_with_checks(
 
 /// Scan an explicit list of `.rs` file paths and aggregate findings from every default check.
 ///
-/// `root` is used only to compute relative file labels in findings (same convention as
-/// [`scan_directory`]). `excludes` are glob patterns matched against each file's path
-/// relative to `root`; matching files are skipped.
+/// Applies the same per-file filter as [`scan_directory`] via [`classify_rust_path`]:
+/// non-`.rs` paths and paths matching an exclude glob (or, when `includes` is non-empty,
+/// not matching any include glob) are dropped; files carrying a generated-file header are
+/// counted in `files_skipped` and not scanned. Findings are deduplicated before returning.
 ///
-/// Returns `(findings, files_scanned)`.
+/// `root` is used to compute the relative label matched against the globs and shown in
+/// findings. The one difference from [`scan_directory`] is that this does not walk a
+/// directory: only the paths passed in are considered.
+///
+/// Returns `(findings, files_scanned, files_skipped)`.
 pub fn scan_files(
     paths: &[PathBuf],
     root: &Path,
     excludes: &[String],
-) -> Result<(Vec<Finding>, usize), ScanError> {
+    includes: &[String],
+) -> Result<(Vec<Finding>, usize, usize), ScanError> {
     let root = root.canonicalize()?;
-    let mut exclude_patterns: Vec<glob::Pattern> = Vec::new();
-    for p in excludes {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => exclude_patterns.push(pattern),
-            Err(e) => return Err(ScanError::InvalidGlobPattern {
-                pattern: p.clone(),
-                reason: e.to_string(),
-            }),
+    let exclude_patterns = compile_globs(excludes)?;
+    let include_patterns = compile_globs(includes)?;
+
+    let mut selected: Vec<PathBuf> = Vec::new();
+    let mut files_skipped = 0;
+    for path in paths {
+        let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
+        match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns)? {
+            PathVerdict::Scan => selected.push(path_canon),
+            PathVerdict::GeneratedSkip => files_skipped += 1,
+            PathVerdict::Reject => {}
         }
     }
 
-    let filtered: Vec<&PathBuf> = paths
-        .iter()
-        .filter(|path| {
-            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
-            !exclude_patterns
-                .iter()
-                .any(|pat| pat.matches_path(label) || pat.matches_path(&path_canon))
-        })
-        .collect();
-
-    let files_scanned = filtered.len();
+    let files_scanned = selected.len();
     let checks = default_checks();
 
-    let mut findings: Vec<Finding> = filtered
+    let mut findings: Vec<Finding> = selected
         .par_iter()
         .map(|path| run_checks_for_file(path, &root, &checks))
         .collect::<Result<Vec<Vec<Finding>>, ScanError>>()?
@@ -519,8 +542,9 @@ pub fn scan_files(
             .cmp(&b.file_path)
             .then_with(|| a.line.cmp(&b.line))
     });
+    dedup_findings(&mut findings);
 
-    Ok((findings, files_scanned))
+    Ok((findings, files_scanned, files_skipped))
 }
 
 #[cfg(test)]
@@ -648,15 +672,67 @@ mod tests {
         fs::write(&included, "pub fn a() {}").unwrap();
         fs::write(&excluded, "pub fn b() {}").unwrap();
 
-        let (_, files_scanned) = scan_files(&[included, excluded.clone()], &root, &[]).unwrap();
+        let (_, files_scanned, files_skipped) =
+            scan_files(&[included.clone(), excluded.clone()], &root, &[], &[]).unwrap();
         assert_eq!(files_scanned, 2);
+        assert_eq!(files_skipped, 0);
 
         // Exclude one file via glob
-        let (_, files_scanned) =
-            scan_files(&[excluded], &root, &["src/other.rs".to_string()]).unwrap();
+        let (_, files_scanned, _) =
+            scan_files(&[excluded], &root, &["src/other.rs".to_string()], &[]).unwrap();
+        assert_eq!(files_scanned, 0);
+
+        // includes now compose the same way as scan_directory
+        let (_, files_scanned, _) =
+            scan_files(&[included], &root, &[], &["src/other*.rs".to_string()]).unwrap();
         assert_eq!(files_scanned, 0);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_files_matches_scan_directory_findings_and_filters_generated() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-scan-files-parity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let vulnerable = root.join("src/lib.rs");
+        let generated = root.join("src/generated.rs");
+        fs::write(
+            &vulnerable,
+            "#[contract]\npub struct C;\n#[contractimpl]\nimpl C {\n    pub fn bump(env: Env) {\n        env.storage().instance().set(&1u32, &2u32);\n    }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &generated,
+            "// @generated\n#[contractimpl]\nimpl G {\n    pub fn go(env: Env) { env.storage().instance().set(&1u32, &2u32); }\n}\n",
+        )
+        .unwrap();
+
+        let (dir_findings, _, dir_skipped) = scan_directory(&root, &[], &[]).unwrap();
+        let (file_findings, files_scanned, file_skipped) =
+            scan_files(&[vulnerable, generated], &root, &[], &[]).unwrap();
+
+        assert_eq!(files_scanned, 1, "the generated file must not be scanned");
+        assert_eq!(file_skipped, 1);
+        assert_eq!(file_skipped, dir_skipped);
+
+        let names = |fs: &[Finding]| {
+            let mut v: Vec<(String, usize)> =
+                fs.iter().map(|f| (f.check_name.clone(), f.line)).collect();
+            v.sort();
+            v
+        };
+        assert!(
+            !file_findings.is_empty(),
+            "expected findings from the readable file"
+        );
+        assert_eq!(names(&file_findings), names(&dir_findings));
     }
 
     #[test]
