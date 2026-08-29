@@ -97,11 +97,51 @@ List the checks that run by default:
 cargo run -p soroban-guard-cli -- list-checks
 ```
 
+Emit a Markdown table (handy for PR comments or docs):
+
+```bash
+cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --markdown
+```
+
 For plain terminal output, disable ANSI colors with:
 
 ```bash
 NO_COLOR=1 soroban-guard scan ./path/to/contract-crate
 ```
+
+Only fail (exit 1) on Medium-or-higher findings, instead of the High-only default:
+
+```bash
+cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --fail-on medium
+```
+
+Skip specific checks (may be repeated), or scope the scan to matching files:
+
+```bash
+cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --disable-check unsafe-randomness --disable-check reentrancy
+cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --include 'src/token*.rs' --exclude 'src/proxy.rs'
+```
+
+Suppress output entirely unless a finding meets the `--fail-on` threshold, or print extra scan statistics:
+
+```bash
+cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --quiet
+cargo run -p soroban-guard-cli -- scan ./path/to/contract-crate --verbose
+```
+
+Print full documentation for a single check:
+
+```bash
+cargo run -p soroban-guard-cli -- explain missing-require-auth
+```
+
+Generate shell completions (Bash, Zsh, Fish, or PowerShell):
+
+```bash
+cargo run -p soroban-guard-cli -- completions zsh > _soroban-guard
+```
+
+> Run `cargo run -p soroban-guard-cli -- scan --help` for the full, always-up-to-date flag reference.
 
 ### Exit codes
 
@@ -110,6 +150,10 @@ NO_COLOR=1 soroban-guard scan ./path/to/contract-crate
 | `0` | No High severity findings — safe to proceed |
 | `1` | At least one High finding — **do not deploy** |
 | `2` | Scan error (I/O or parse failure) |
+
+### Configuration file
+
+Drop a `soroban-guard.toml` in the scan root to set defaults without CLI flags — min severity, disabled checks, and extra sensitive-name patterns. See [docs/configuration.md](docs/configuration.md) for the full schema and an example file.
 
 ---
 
@@ -129,10 +173,7 @@ Guard-CLI/
 │   └── checks/                 # Check trait + individual detectors
 │       └── src/
 │           ├── lib.rs          # trait definition, Finding, Severity, default_checks()
-│           ├── auth.rs         # missing-require-auth
-│           ├── overflow.rs     # unchecked-arithmetic
-│           ├── admin.rs        # unprotected-admin
-│           └── storage.rs      # unsafe-storage-patterns
+│           └── ...             # one module per detector; see docs/checks.md for the full list
 └── test-contracts/             # standalone Soroban crates (excluded from workspace)
     ├── vulnerable/             # triggers missing-require-auth
     ├── safe/                   # passes missing-require-auth
@@ -215,10 +256,7 @@ impl Check for MyCustomCheck {
 // crates/checks/src/lib.rs — register it here
 pub fn default_checks() -> Vec<Box<dyn Check + Send + Sync>> {
     vec![
-        Box::new(MissingRequireAuthCheck),
-        Box::new(UncheckedArithmeticCheck),
-        Box::new(UnprotectedAdminCheck),
-        Box::new(UnsafeStoragePatternsCheck),
+        // ...(existing checks)...
         Box::new(MyCustomCheck),   // 👈 add your check
     ]
 }
@@ -285,7 +323,7 @@ stellar contract deploy \
 | `crates/analyzer` | Walk `.rs` files, parse with `syn`, run checks |
 | `crates/checks` | `Check` trait + individual detectors |
 
-See `docs/checks.md` for implemented rules, `docs/json-schema.md` for the `--json` output schema, `docs/integrations.md` for pre-commit / CI / editor snippets, and `CONTRIBUTING.md` to add a check.
+See `docs/checks.md` for implemented rules, `docs/json-schema.md` for the `--json` output schema, `docs/integrations.md` for pre-commit / CI / editor snippets, `docs/configuration.md` for the `soroban-guard.toml` project config file, and `CONTRIBUTING.md` to add a check.
 
 ---
 

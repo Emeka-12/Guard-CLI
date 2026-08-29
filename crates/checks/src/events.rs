@@ -1,11 +1,14 @@
 
 //! Detection of state-changing functions (storage writes) without event emission.
 
-use crate::util::contractimpl_functions;
+use crate::util::{
+    contractimpl_functions_excluding_test, receiver_chain_contains_events,
+    receiver_chain_contains_storage,
+};
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Block, Expr, ExprMethodCall, File};
+use syn::{Block, ExprMethodCall, File};
 
 const CHECK_NAME: &str = "missing-event-emission";
 
@@ -19,7 +22,7 @@ impl Check for MissingEventEmissionCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let mut scan = FuncBodyScan::default();
             scan.visit_block(&method.block);
             if !scan.storage_write || scan.event_emitted {
@@ -38,24 +41,19 @@ impl Check for MissingEventEmissionCheck {
                     "Method `{fn_name}` writes to storage but does not emit an event. Consider using \
                      `env.events().publish(…)` to allow off-chain indexers to track contract activity."
                 ),
-                rule_url: None,
+                rule_url: Some(
+                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#missing-event-emission-medium"
+                        .to_string(),
+                ),
                 suggestion: None,
+                rule_url: None,
+                suggestion: Some(format!(
+                    "Add `env.events().publish((symbol_short!(\"{fn_name}\"), …), &payload)` \
+                     after the storage write so off-chain indexers can track this state change."
+                )),
             });
         }
         out
-    }
-}
-
-fn receiver_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "storage" {
-                return true;
-            }
-            receiver_chain_contains_storage(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_storage(&f.base),
-        _ => false,
     }
 }
 
@@ -68,19 +66,6 @@ fn is_storage_mutation_call(m: &ExprMethodCall) -> bool {
         return false;
     }
     receiver_chain_contains_storage(&m.receiver)
-}
-
-fn receiver_chain_contains_events(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "events" {
-                return true;
-            }
-            receiver_chain_contains_events(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_events(&f.base),
-        _ => false,
-    }
 }
 
 fn is_event_publish_call(m: &ExprMethodCall) -> bool {

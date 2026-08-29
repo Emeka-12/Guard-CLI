@@ -1,6 +1,8 @@
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
-use syn::{ImplItem, ItemImpl, FnArg, Pat, PatType};
+use syn::spanned::Spanned;
+use syn::{ImplItem, ItemImpl, FnArg, Pat};
+
 
 const CHECK_NAME: &str = "missing-input-length-bound";
 
@@ -28,7 +30,7 @@ impl<'ast> Visit<'ast> for InputLengthVisitor {
         if has_contractimpl_attr(&node.attrs) {
             for item in &node.items {
                 if let ImplItem::Fn(method) = item {
-                    if method.sig.vis.is_pub() {
+                    if matches!(method.vis, syn::Visibility::Public(_)) {
                         let bytes_vec_params = find_bytes_vec_params(&method.sig.inputs);
                         for (param_name, _) in bytes_vec_params {
                             if !has_length_check(&method.block, &param_name) {
@@ -42,7 +44,10 @@ impl<'ast> Visit<'ast> for InputLengthVisitor {
                                         "Parameter `{}` (Bytes/Vec) lacks length validation",
                                         param_name
                                     ),
-                                    rule_url: None,
+                                    rule_url: Some(
+                                        "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#missing-input-length-bound-medium"
+                                            .to_string(),
+                                    ),
                                     suggestion: Some(
                                         "Validate parameter length with .len() or .is_empty()"
                                             .to_string(),

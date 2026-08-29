@@ -1,15 +1,73 @@
-//! Walk Rust sources, parse with `syn`, and run all registered checks.
+//! Walk Rust sources, parse with `syn`, and run registered checks.
 //!
 //! Each [`Check`](soroban_guard_checks::Check) runs independently on the same parsed file;
-//! findings are concatenated with **no shared mutable state** between checks.
+//! findings are concatenated with no shared mutable state between checks.
 
 use rayon::prelude::*;
+use soroban_guard_checks::util::contractimpl_functions_with_type_excluding_test;
 use soroban_guard_checks::{default_checks, Check, Finding};
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use syn::spanned::Spanned;
 use thiserror::Error;
 use walkdir::WalkDir;
+
+const SUPPRESSION_PREFIX: &str = "// soroban-guard: allow(";
+
+/// The source line range of one `#[contractimpl]` method, paired with its enclosing type's
+/// name — used to scope function-level suppressions to the specific `impl` block they were
+/// written above, instead of matching any same-named method anywhere in the file.
+struct FnSpan {
+    impl_type: String,
+    function_name: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn build_fn_spans(file: &syn::File) -> Vec<FnSpan> {
+    contractimpl_functions_with_type_excluding_test(file)
+        .into_iter()
+        .map(|(impl_type, method)| FnSpan {
+            impl_type,
+            function_name: method.sig.ident.to_string(),
+            start_line: method.sig.ident.span().start().line,
+            end_line: method.block.span().end().line,
+        })
+        .collect()
+}
+
+#[derive(Error, Debug)]
+pub enum ScanError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Permission denied reading {path}")]
+    PermissionDenied { path: PathBuf },
+    #[error("IO error reading {path}: {source}")]
+    IoRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Failed to parse {path}: {message}")]
+    Parse { path: PathBuf, message: String },
+    #[error("Check `{check}` panicked on {path}: {message}")]
+    CheckPanic {
+        check: String,
+        path: PathBuf,
+        message: String,
+    },
+    #[error("Invalid glob pattern `{pattern}`: {reason}")]
+    InvalidGlobPattern { pattern: String, reason: String },
+}
+
+#[derive(Default)]
+struct Suppressions {
+    line_checks: HashSet<(usize, String)>,
+    /// Keyed on `(impl_type, function_name, check_name)` so a suppression above one
+    /// `#[contractimpl]` method doesn't also silence a same-named method on a different type.
+    function_checks: HashSet<(String, String, String)>,
+}
 
 fn has_generated_file_header(path: &Path) -> Result<bool, std::io::Error> {
     let file = std::fs::File::open(path)?;
@@ -33,23 +91,328 @@ fn has_generated_file_header(path: &Path) -> Result<bool, std::io::Error> {
     Ok(false)
 }
 
-#[derive(Error, Debug)]
-pub enum ScanError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Permission denied reading {path}")]
-    PermissionDenied { path: PathBuf },
-    #[error("Failed to parse {path}: {message}")]
-    Parse { path: PathBuf, message: String },
-    #[error("Check `{check}` panicked on {path}: {message}")]
-    CheckPanic {
-        check: String,
-        path: PathBuf,
-        message: String,
-    },
+fn parse_allow_checks(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix(SUPPRESSION_PREFIX)?;
+    let (inside, _) = rest.split_once(')')?;
+    let checks: Vec<String> = inside
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    (!checks.is_empty()).then_some(checks)
 }
 
-/// Recursively scan `.rs` files under `root` and aggregate findings from every check.
+/// Index of the first line at or after `from` that carries actual code, skipping the
+/// lines rustfmt and normal documentation routinely insert between a suppression
+/// comment and the item it applies to: blank lines, `//` / `///` / `//!` comments, and
+/// `#[...]` / `#![...]` attribute lines.
+fn next_substantive_line(lines: &[&str], from: usize) -> Option<usize> {
+    (from..lines.len()).find(|&i| {
+        let t = lines[i].trim_start();
+        !(t.is_empty() || t.starts_with("//") || t.starts_with("#[") || t.starts_with("#!["))
+    })
+}
+
+fn parse_suppressions(source: &str, fn_spans: &[FnSpan]) -> Suppressions {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut suppressions = Suppressions::default();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let Some(checks) = parse_allow_checks(line) else {
+            continue;
+        };
+        let Some(target_idx) = next_substantive_line(&lines, idx + 1) else {
+            continue;
+        };
+        let target_line_number = target_idx + 1;
+        // Resolve the target from the parsed `#[contractimpl]` spans, keyed on the line
+        // the method starts on - never by scanning the raw text for `"fn "`, which also
+        // matches comments, string literals, and type positions.
+        if let Some(span) = fn_spans.iter().find(|s| s.start_line == target_line_number) {
+            for check in checks {
+                suppressions.function_checks.insert((
+                    span.impl_type.clone(),
+                    span.function_name.clone(),
+                    check,
+                ));
+            }
+        } else {
+            for check in checks {
+                suppressions.line_checks.insert((target_line_number, check));
+            }
+        }
+    }
+
+    suppressions
+}
+
+fn is_suppressed(finding: &Finding, suppressions: &Suppressions, fn_spans: &[FnSpan]) -> bool {
+    if suppressions
+        .line_checks
+        .contains(&(finding.line, finding.check_name.clone()))
+    {
+        return true;
+    }
+    let impl_type = fn_spans
+        .iter()
+        .find(|s| {
+            s.function_name == finding.function_name
+                && s.start_line <= finding.line
+                && finding.line <= s.end_line
+        })
+        .map(|s| s.impl_type.clone())
+        .unwrap_or_default();
+    suppressions.function_checks.contains(&(
+        impl_type,
+        finding.function_name.clone(),
+        finding.check_name.clone(),
+    ))
+}
+
+/// Drop only findings that are identical in everything a reader would use to tell
+/// them apart. Keying on `(file, line, check_name)` alone collapsed distinct
+/// same-line findings from checks that legitimately report more than once per line
+/// (e.g. one `unchecked-arithmetic` hit per operator).
+fn dedup_findings(findings: &mut Vec<Finding>) {
+    let mut seen = HashSet::new();
+    findings.retain(|f| {
+        seen.insert((
+            f.file_path.clone(),
+            f.line,
+            f.check_name.clone(),
+            f.function_name.clone(),
+            f.description.clone(),
+            f.severity,
+        ))
+    });
+}
+
+/// Compile a list of glob source strings into `glob::Pattern`s, surfacing the first
+/// invalid pattern as `ScanError::InvalidGlobPattern`. Shared by the exclude and
+/// include filters so `--include`/`--exclude` stay behaviourally identical.
+fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => compiled.push(pattern),
+            Err(e) => {
+                return Err(ScanError::InvalidGlobPattern {
+                    pattern: p.clone(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+    Ok(compiled)
+}
+
+/// True when any pattern matches the path, tested both against the root-relative
+/// `label` and the full `path` (a pattern like `vendor/**` should match either form).
+fn glob_matches(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
+    patterns
+        .iter()
+        .any(|p| p.matches_path(label) || p.matches_path(path))
+}
+
+/// Compile glob source strings into patterns, surfacing the first invalid one as
+/// `ScanError::InvalidGlobPattern`. Shared by every scan entry point so exclude and
+/// include filters compile identically.
+fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        match glob::Pattern::new(p) {
+            Ok(pattern) => compiled.push(pattern),
+            Err(e) => {
+                return Err(ScanError::InvalidGlobPattern {
+                    pattern: p.clone(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+    Ok(compiled)
+}
+
+/// Result of applying the shared source-file filter to one candidate path.
+enum PathVerdict {
+    /// A `.rs` file that passed every filter and should be scanned.
+    Scan,
+    /// A `.rs` file omitted because it carries a generated-file header.
+    GeneratedSkip,
+    /// Not a `.rs` file, or excluded by an exclude/include glob.
+    Reject,
+}
+
+fn glob_hit(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
+    patterns
+        .iter()
+        .any(|p| p.matches_path(label) || p.matches_path(path))
+}
+
+/// The single filter every scan entry point applies to a candidate source file:
+/// `.rs` extension, exclude globs, include globs (when non-empty), then the
+/// generated-file header check. `label` is the path relative to the scan root.
+fn classify_rust_path(
+    path: &Path,
+    label: &Path,
+    exclude_patterns: &[glob::Pattern],
+    include_patterns: &[glob::Pattern],
+) -> Result<PathVerdict, ScanError> {
+    if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+        return Ok(PathVerdict::Reject);
+    }
+    if glob_hit(exclude_patterns, label, path) {
+        return Ok(PathVerdict::Reject);
+    }
+    if !include_patterns.is_empty() && !glob_hit(include_patterns, label, path) {
+        return Ok(PathVerdict::Reject);
+    }
+    if has_generated_file_header(path)? {
+        return Ok(PathVerdict::GeneratedSkip);
+    }
+    Ok(PathVerdict::Scan)
+}
+
+/// Collect `.rs` paths under `root`, applying exclude/include glob filters and skipping
+/// files that carry a generated-file header. Returns `(paths, files_skipped)` where
+/// `files_skipped` is the count of files omitted due to the generated-file header.
+fn collect_rust_paths(
+    root: &Path,
+    excludes: &[String],
+    includes: &[String],
+) -> Result<(Vec<PathBuf>, usize), ScanError> {
+    let exclude_patterns = compile_globs(excludes)?;
+    let include_patterns = compile_globs(includes)?;
+
+    if root.is_file() {
+        return Ok((vec![root.to_path_buf()], 0));
+    }
+
+    let mut files_skipped = 0;
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("target" | ".git")))
+        {
+            continue;
+        }
+        let label = path.strip_prefix(root).unwrap_or(path);
+        if glob_matches(&exclude_patterns, label, path) {
+            continue;
+        }
+        if !include_patterns.is_empty() && !glob_matches(&include_patterns, label, path) {
+            continue;
+        }
+        // An unreadable file must not abort the whole scan (a `0600` file in a shared
+        // checkout, a broken symlink, a race with WalkDir's listing). Warn naming the
+        // path and skip it, matching the warn-and-continue precedent for check panics.
+        match has_generated_file_header(path) {
+            Ok(true) => {
+                files_skipped += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let err = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    ScanError::PermissionDenied {
+                        path: path.to_path_buf(),
+                    }
+                } else {
+                    ScanError::IoRead {
+                        path: path.to_path_buf(),
+                        source: e,
+                    }
+                };
+                eprintln!("warning: {err}, skipping file");
+                continue;
+            }
+        }
+    }
+
+    Ok((paths, files_skipped))
+}
+
+fn run_checks_for_file(
+    path: &Path,
+    root: &Path,
+    checks: &[Box<dyn Check + Send + Sync>],
+) -> Result<Vec<Finding>, ScanError> {
+    let content = std::fs::read_to_string(path).map_err(|e| ScanError::IoRead {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let syn_file = syn::parse_file(&content).map_err(|e| ScanError::Parse {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    let file_label = if root.is_file() {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    } else {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    };
+    let fn_spans = build_fn_spans(&syn_file);
+    let suppressions = parse_suppressions(&content, &fn_spans);
+
+    let mut findings: Vec<Finding> = checks
+        .iter()
+        .flat_map(|check| {
+            let check_name = check.name().to_string();
+            match catch_unwind(AssertUnwindSafe(|| check.run(&syn_file, &content))) {
+                Ok(mut hits) => {
+                    for finding in &mut hits {
+                        finding.file_path.clone_from(&file_label);
+                    }
+                    hits
+                }
+                Err(payload) => {
+                    let message = if let Some(msg) = payload.downcast_ref::<&str>() {
+                        msg.to_string()
+                    } else if let Some(msg) = payload.downcast_ref::<String>() {
+                        msg.clone()
+                    } else {
+                        "panic payload was not a string".to_string()
+                    };
+                    eprintln!(
+                        "warning: {}",
+                        ScanError::CheckPanic {
+                            check: check_name,
+                            path: path.to_path_buf(),
+                            message,
+                        }
+                    );
+                    Vec::new()
+                }
+            }
+        })
+        .filter(|finding| !is_suppressed(finding, &suppressions, &fn_spans))
+        .collect();
+
+    findings.sort_by_key(|f| f.line);
+    dedup_findings(&mut findings);
+    Ok(findings)
+}
+
+/// Findings for a single source file.
+#[derive(Debug)]
+pub struct FileScanResult {
+    pub file_path: String,
+    pub findings: Vec<Finding>,
+}
+
+/// Recursively scan `.rs` files under `root` and aggregate findings from every default check.
 ///
 /// `root` may be a directory **or a single `.rs` file**. When a file path is given it is scanned
 /// directly without any directory walk.
@@ -60,123 +423,22 @@ pub enum ScanError {
 /// `includes` are glob patterns; when non-empty only files matching at least one pattern are
 /// scanned. When `includes` is empty all `.rs` files (minus excludes and generated-file
 /// headers) are scanned.
+///
+/// Returns `(findings, files_scanned, files_skipped)` where `files_skipped` counts files
+/// omitted because they carry a generated-file header.
 pub fn scan_directory(
     root: &Path,
     excludes: &[String],
     includes: &[String],
 ) -> Result<(Vec<Finding>, usize, usize), ScanError> {
-/// `root` is used only to compute relative file labels in findings (same convention as
-/// [`scan_directory`]). `excludes` are glob patterns matched against each file's path
-/// relative to `root`; matching files are skipped.
-pub fn scan_files(
-    paths: &[PathBuf],
-    root: &Path,
-    excludes: &[String],
-) -> Result<(Vec<Finding>, usize), ScanError> {
     let root = root.canonicalize()?;
-
-    // Single-file fast path: skip the directory walk entirely.
-    if root.is_file() {
-        let content = std::fs::read_to_string(&root)?;
-        let syn_file = syn::parse_file(&content).map_err(|error| ScanError::Parse {
-            path: root.clone(),
-            message: error.to_string(),
-        })?;
-        let file_label = root.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let checks = default_checks();
-        let mut findings: Vec<Finding> = checks
-            .iter()
-            .flat_map(|check| {
-                let mut hits = check.run(&syn_file, &content);
-                for f in &mut hits {
-                    f.file_path.clone_from(&file_label);
-                }
-                hits
-            })
-            .collect();
-        findings.sort_by(|a, b| a.line.cmp(&b.line));
-        return Ok((findings, 1));
-    }
-    let exclude_patterns: Vec<glob::Pattern> = excludes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-
-    let filtered: Vec<&PathBuf> = paths
-        .iter()
-        .filter(|path| {
-            let label = path.strip_prefix(root).unwrap_or(path);
-            !exclude_patterns
-                .iter()
-                .any(|pat| pat.matches_path(label) || pat.matches_path(path))
-        })
-        .map(|entry| entry.path().to_path_buf())
-        .collect();
-
-    let mut files_skipped = 0;
-    let mut scan_entries = Vec::new();
-    for entry in entries {
-        let path = entry.path();
-        if has_generated_file_header(path)? {
-            files_skipped += 1;
-            continue;
-        }
-        scan_entries.push(entry);
-    }
-    let files_scanned = scan_entries.len();
-
-    let mut findings: Vec<Finding> = scan_entries
-    let files_scanned = filtered.len();
     let checks = default_checks();
+    let (paths, files_skipped) = collect_rust_paths(&root, excludes, includes)?;
+    let files_scanned = paths.len();
 
-    let mut findings: Vec<Finding> = filtered
+    let mut findings: Vec<Finding> = paths
         .par_iter()
-        .map(|entry| {
-            let path = entry.path();
-            let content = std::fs::read_to_string(path)?;
-            let syn_file = syn::parse_file(&content).map_err(|e| ScanError::Parse {
-                path: path.to_path_buf(),
-                message: e.to_string(),
-            })?;
-
-            let file_label = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-
-            let file_findings: Vec<Finding> = checks
-                .iter()
-                .flat_map(|check| {
-                    let check_name = check.name().to_string();
-                    match catch_unwind(AssertUnwindSafe(|| check.run(&syn_file, &content))) {
-                        Ok(mut hits) => {
-                            for f in &mut hits {
-                                f.file_path.clone_from(&file_label);
-                            }
-                            hits
-                        }
-                        Err(payload) => {
-                            let message = if let Some(msg) = payload.downcast_ref::<&str>() {
-                                msg.to_string()
-                            } else if let Some(msg) = payload.downcast_ref::<String>() {
-                                msg.clone()
-                            } else {
-                                "panic payload was not a string".to_string()
-                            };
-                            eprintln!("warning: {}", ScanError::CheckPanic {
-                                check: check_name,
-                                path: path.to_path_buf(),
-                                message,
-                            });
-                            Vec::new()
-                        }
-                    }
-                })
-                .collect();
-
-            Ok(file_findings)
-        })
+        .map(|path| run_checks_for_file(path, &root, &checks))
         .collect::<Result<Vec<Vec<Finding>>, ScanError>>()?
         .into_iter()
         .flatten()
@@ -187,199 +449,97 @@ pub fn scan_files(
             .cmp(&b.file_path)
             .then_with(|| a.line.cmp(&b.line))
     });
-
+    dedup_findings(&mut findings);
     Ok((findings, files_scanned, files_skipped))
 }
 
-/// Findings for a single source file.
-#[derive(Debug)]
-pub struct FileScanResult {
-    pub file_path: String,
-    pub findings: Vec<Finding>,
-}
-
-/// Recursively scan `.rs` files under `root` and aggregate findings from every check.
-///
-/// `excludes` are glob patterns (e.g. `vendor/**`, `**/generated/*.rs`) matched against each
-/// file's path relative to `root`; matching files are skipped entirely.
-///
-/// `includes` are glob patterns; when non-empty only files matching at least one pattern are
-/// scanned. When `includes` is empty all `.rs` files (minus excludes) are scanned.
-pub fn scan_directory(
-    root: &Path,
-    excludes: &[String],
-    includes: &[String],
-) -> Result<(Vec<FileScanResult>, usize), ScanError> {
-    let root = root.canonicalize()?;
-    let exclude_patterns: Vec<glob::Pattern> = excludes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-    let include_patterns: Vec<glob::Pattern> = includes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-
-    let paths: Vec<PathBuf> = WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            if !entry.file_type().is_file() {
-                return false;
-            }
-            let path = entry.path();
-            if path
-                .components()
-                .any(|c| matches!(c.as_os_str().to_str(), Some("target" | ".git")))
-            {
-                return false;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                return false;
-            }
-            let label = path.strip_prefix(&root).unwrap_or(path);
-            if exclude_patterns
-                .iter()
-                .any(|p| p.matches_path(label) || p.matches_path(path))
-            {
-                return false;
-            }
-            if !include_patterns.is_empty()
-                && !include_patterns
-                    .iter()
-                    .any(|p| p.matches_path(label) || p.matches_path(path))
-            {
-                return false;
-            }
-            true
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
-
-    // Excludes already applied above; pass empty slice to avoid double-filtering.
-    let (mut results, count) = scan_files(&paths, &root, &[])?;
-    for r in &mut results {
-        dedup_findings(&mut r.findings);
-    }
-    results.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-    Ok((results, count))
-}
-
-/// Remove duplicate findings with the same `(file_path, line, check_name)`, keeping the first.
-fn dedup_findings(findings: &mut Vec<Finding>) {
-    let mut seen = std::collections::HashSet::new();
-    findings.retain(|f| seen.insert((f.file_path.clone(), f.line, f.check_name.clone())));
-}
-
 /// Like [`scan_directory`] but runs `checks` instead of [`default_checks`].
+///
+/// Returns `(results, files_scanned, files_skipped)` where each element of `results` groups
+/// findings by source file, and `files_skipped` counts files omitted due to generated-file
+/// headers (see [`scan_directory`]).
 pub fn scan_directory_with_checks(
     root: &Path,
     excludes: &[String],
     includes: &[String],
     checks: &[Box<dyn Check + Send + Sync>],
-) -> Result<(Vec<FileScanResult>, usize), ScanError> {
+) -> Result<(Vec<FileScanResult>, usize, usize), ScanError> {
     let root = root.canonicalize()?;
-    let exclude_patterns: Vec<glob::Pattern> = excludes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-    let include_patterns: Vec<glob::Pattern> = includes
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
-
-    let paths: Vec<PathBuf> = WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            if !entry.file_type().is_file() {
-                return false;
-            }
-            let path = entry.path();
-            if path
-                .components()
-                .any(|c| matches!(c.as_os_str().to_str(), Some("target" | ".git")))
-            {
-                return false;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                return false;
-            }
-            let label = path.strip_prefix(&root).unwrap_or(path);
-            if exclude_patterns
-                .iter()
-                .any(|p| p.matches_path(label) || p.matches_path(path))
-            {
-                return false;
-            }
-            if !include_patterns.is_empty()
-                && !include_patterns
-                    .iter()
-                    .any(|p| p.matches_path(label) || p.matches_path(path))
-            {
-                return false;
-            }
-            true
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
-
+    let (paths, files_skipped) = collect_rust_paths(&root, excludes, includes)?;
     let files_scanned = paths.len();
-    let results: Vec<FileScanResult> = paths
+
+    let mut results: Vec<FileScanResult> = paths
         .par_iter()
         .map(|path| {
-            let content = std::fs::read_to_string(path)?;
-            let syn_file = syn::parse_file(&content).map_err(|e| ScanError::Parse {
-                path: path.clone(),
-                message: e.to_string(),
-            })?;
-            let file_label = path
-                .strip_prefix(&root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-            let mut findings: Vec<Finding> = checks
-                .iter()
-                .flat_map(|check| {
-                    let check_name = check.name().to_string();
-                    match catch_unwind(AssertUnwindSafe(|| check.run(&syn_file, &content))) {
-                        Ok(mut hits) => {
-                            for f in &mut hits {
-                                f.file_path.clone_from(&file_label);
-                            }
-                            hits
-                        }
-                        Err(payload) => {
-                            let message = if let Some(msg) = payload.downcast_ref::<&str>() {
-                                msg.to_string()
-                            } else if let Some(msg) = payload.downcast_ref::<String>() {
-                                msg.clone()
-                            } else {
-                                "panic payload was not a string".to_string()
-                            };
-                            eprintln!(
-                                "warning: {}",
-                                ScanError::CheckPanic {
-                                    check: check_name,
-                                    path: path.clone(),
-                                    message,
-                                }
-                            );
-                            Vec::new()
-                        }
-                    }
-                })
-                .collect();
-            findings.sort_by_key(|f| f.line);
-            dedup_findings(&mut findings);
+            let findings = run_checks_for_file(path, &root, checks)?;
+            let file_label = if root.is_file() {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                path.strip_prefix(&root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string()
+            };
             Ok(FileScanResult { file_path: file_label, findings })
         })
         .collect::<Result<Vec<_>, ScanError>>()?;
 
     results.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-    Ok((results, files_scanned))
+    Ok((results, files_scanned, files_skipped))
+}
+
+/// Scan an explicit list of `.rs` file paths and aggregate findings from every default check.
+///
+/// Applies the same per-file filter as [`scan_directory`] via [`classify_rust_path`]:
+/// non-`.rs` paths and paths matching an exclude glob (or, when `includes` is non-empty,
+/// not matching any include glob) are dropped; files carrying a generated-file header are
+/// counted in `files_skipped` and not scanned. Findings are deduplicated before returning.
+///
+/// `root` is used to compute the relative label matched against the globs and shown in
+/// findings. The one difference from [`scan_directory`] is that this does not walk a
+/// directory: only the paths passed in are considered.
+///
+/// Returns `(findings, files_scanned, files_skipped)`.
+pub fn scan_files(
+    paths: &[PathBuf],
+    root: &Path,
+    excludes: &[String],
+    includes: &[String],
+) -> Result<(Vec<Finding>, usize, usize), ScanError> {
+    let root = root.canonicalize()?;
+    let exclude_patterns = compile_globs(excludes)?;
+
+    let filtered: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|path| {
+            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
+            !glob_matches(&exclude_patterns, label, &path_canon)
+        })
+        .collect();
+
+    let files_scanned = filtered.len();
+    let checks = default_checks();
+
+    let mut findings: Vec<Finding> = selected
+        .par_iter()
+        .map(|path| run_checks_for_file(path, &root, &checks))
+        .collect::<Result<Vec<Vec<Finding>>, ScanError>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    findings.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then_with(|| a.line.cmp(&b.line))
+    });
+    dedup_findings(&mut findings);
+
+    Ok((findings, files_scanned, files_skipped))
 }
 
 #[cfg(test)]
@@ -400,8 +560,9 @@ mod tests {
         let file_path = dir.join("lib.rs");
         fs::write(&file_path, "pub fn f() {}").unwrap();
 
-        let (_, files_scanned) = scan_directory(&file_path, &[], &[]).unwrap();
+        let (_, files_scanned, files_skipped) = scan_directory(&file_path, &[], &[]).unwrap();
         assert_eq!(files_scanned, 1);
+        assert_eq!(files_skipped, 0);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -506,15 +667,280 @@ mod tests {
         fs::write(&included, "pub fn a() {}").unwrap();
         fs::write(&excluded, "pub fn b() {}").unwrap();
 
-        let (_, files_scanned) = scan_files(&[included, excluded.clone()], &root, &[]).unwrap();
+        let (_, files_scanned, files_skipped) =
+            scan_files(&[included.clone(), excluded.clone()], &root, &[], &[]).unwrap();
         assert_eq!(files_scanned, 2);
+        assert_eq!(files_skipped, 0);
 
         // Exclude one file via glob
-        let (_, files_scanned) =
-            scan_files(&[excluded], &root, &["src/other.rs".to_string()]).unwrap();
+        let (_, files_scanned, _) =
+            scan_files(&[excluded], &root, &["src/other.rs".to_string()], &[]).unwrap();
+        assert_eq!(files_scanned, 0);
+
+        // includes now compose the same way as scan_directory
+        let (_, files_scanned, _) =
+            scan_files(&[included], &root, &[], &["src/other*.rs".to_string()]).unwrap();
         assert_eq!(files_scanned, 0);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One unreadable `.rs` file must not abort the scan: findings for the readable
+    /// files are still returned. Unix-only (relies on POSIX mode bits); skipped when
+    /// running as root, where the mode bits do not deny access.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_does_not_abort_scan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-unreadable-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let readable = root.join("src/readable.rs");
+        fs::write(
+            &readable,
+            "#[contract]\npub struct C;\n#[contractimpl]\nimpl C {\n    pub fn bump(env: Env) {\n        env.storage().instance().set(&1u32, &2u32);\n    }\n}\n",
+        )
+        .unwrap();
+
+        let unreadable = root.join("src/unreadable.rs");
+        fs::write(&unreadable, "pub fn secret() {}").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // If the process can still read the file (running as root), the scenario
+        // under test does not exist; skip rather than assert a false negative.
+        if fs::read_to_string(&unreadable).is_ok() {
+            let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+            fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+
+        let (findings, files_scanned, _) = scan_directory(&root, &[], &[]).unwrap();
+        assert_eq!(
+            files_scanned, 1,
+            "the readable file should still be scanned"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.check_name == "missing-require-auth"),
+            "expected a finding from the readable file, got {findings:?}"
+        );
+
+        let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_files_matches_scan_directory_findings_and_filters_generated() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-scan-files-parity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let vulnerable = root.join("src/lib.rs");
+        let generated = root.join("src/generated.rs");
+        fs::write(
+            &vulnerable,
+            "#[contract]\npub struct C;\n#[contractimpl]\nimpl C {\n    pub fn bump(env: Env) {\n        env.storage().instance().set(&1u32, &2u32);\n    }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &generated,
+            "// @generated\n#[contractimpl]\nimpl G {\n    pub fn go(env: Env) { env.storage().instance().set(&1u32, &2u32); }\n}\n",
+        )
+        .unwrap();
+
+        let (dir_findings, _, dir_skipped) = scan_directory(&root, &[], &[]).unwrap();
+        let (file_findings, files_scanned, file_skipped) =
+            scan_files(&[vulnerable, generated], &root, &[], &[]).unwrap();
+
+        assert_eq!(files_scanned, 1, "the generated file must not be scanned");
+        assert_eq!(file_skipped, 1);
+        assert_eq!(file_skipped, dir_skipped);
+
+        let names = |fs: &[Finding]| {
+            let mut v: Vec<(String, usize)> =
+                fs.iter().map(|f| (f.check_name.clone(), f.line)).collect();
+            v.sort();
+            v
+        };
+        assert!(
+            !file_findings.is_empty(),
+            "expected findings from the readable file"
+        );
+        assert_eq!(names(&file_findings), names(&dir_findings));
+    }
+
+    #[test]
+    fn scan_directory_rejects_invalid_exclude_glob() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-invalid-glob-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let result = scan_directory(&root, &["src/[foo.rs".to_string()], &[]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid glob pattern") || err_msg.contains("src/[foo.rs"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_directory_rejects_invalid_include_glob() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-invalid-include-glob-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let result = scan_directory(&root, &[], &["src/[invalid.rs".to_string()]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid glob pattern") || err_msg.contains("src/[invalid.rs"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod suppression_tests {
+    use super::*;
+
+    fn suppressions_for(src: &str) -> Suppressions {
+        let file = syn::parse_file(src).expect("fixture should parse");
+        let fn_spans = build_fn_spans(&file);
+        parse_suppressions(src, &fn_spans)
+    }
+
+    fn has_fn_suppression(s: &Suppressions, func: &str, check: &str) -> bool {
+        let key = (String::from("C"), func.to_string(), check.to_string());
+        s.function_checks.contains(&key)
+    }
+
+    #[test]
+    fn suppression_binds_across_an_attribute_line() {
+        let src = "\
+#[contract]
+pub struct C;
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(missing-require-auth)
+    #[allow(dead_code)]
+    pub fn set_admin(env: Env, a: Address) { let _ = (env, a); }
+}
+";
+        let s = suppressions_for(src);
+        assert!(has_fn_suppression(&s, "set_admin", "missing-require-auth"));
+    }
+
+    #[test]
+    fn suppression_binds_across_a_blank_line() {
+        let src = "\
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(unchecked-arithmetic)
+
+    pub fn accrue(env: Env) { let _ = env; }
+}
+";
+        let s = suppressions_for(src);
+        assert!(has_fn_suppression(&s, "accrue", "unchecked-arithmetic"));
+    }
+
+    #[test]
+    fn suppression_binds_across_a_doc_comment() {
+        let src = "\
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(missing-event-emission)
+    /// Updates the fee schedule.
+    pub fn set_fee(env: Env, bps: u32) { let _ = (env, bps); }
+}
+";
+        let s = suppressions_for(src);
+        assert!(has_fn_suppression(&s, "set_fee", "missing-event-emission"));
+    }
+
+    #[test]
+    fn suppression_directly_above_a_non_fn_statement_stays_line_level() {
+        let src = "\
+#[contractimpl]
+impl C {
+    pub fn go(env: Env) {
+        // soroban-guard: allow(unchecked-arithmetic)
+        let x = 1 + 2;
+        let _ = (env, x);
+    }
+}
+";
+        let s = suppressions_for(src);
+        // line 5 is `let x = 1 + 2;`
+        assert!(s
+            .line_checks
+            .contains(&(5, "unchecked-arithmetic".to_string())));
+        assert!(s.function_checks.is_empty());
+    }
+
+    #[test]
+    fn fn_in_a_string_literal_registers_no_function_suppression() {
+        let src = "\
+#[contractimpl]
+impl C {
+    pub fn go(env: Env) {
+        // soroban-guard: allow(hardcoded-address)
+        let msg = \"call fn later\";
+        let _ = (env, msg);
+    }
+}
+";
+        let s = suppressions_for(src);
+        assert!(s.function_checks.is_empty());
+        assert!(s
+            .line_checks
+            .contains(&(5, "hardcoded-address".to_string())));
+    }
+
+    #[test]
+    fn fn_in_a_type_position_registers_no_function_suppression() {
+        let src = "\
+#[contractimpl]
+impl C {
+    pub fn go(env: Env) {
+        // soroban-guard: allow(unchecked-arithmetic)
+        let handler: fn(u32) -> u32 = double;
+        let _ = (env, handler);
+    }
+}
+";
+        let s = suppressions_for(src);
+        assert!(s.function_checks.is_empty());
+        assert!(s
+            .line_checks
+            .contains(&(5, "unchecked-arithmetic".to_string())));
     }
 }
 
@@ -556,7 +982,7 @@ mod dedup_tests {
 
         let checks: Vec<Box<dyn soroban_guard_checks::Check + Send + Sync>> =
             vec![Box::new(DuplicatingCheck)];
-        let (results, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
+        let (results, _, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
 
         let total: usize = results.iter().map(|r| r.findings.len()).sum();
         assert_eq!(total, 1, "expected 1 finding after dedup, got {}", total);
@@ -608,7 +1034,7 @@ mod dedup_tests {
 
         let checks: Vec<Box<dyn soroban_guard_checks::Check + Send + Sync>> =
             vec![Box::new(ReversedCheck)];
-        let (results, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
+        let (results, _, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
 
         // Files must be in lexicographic order.
         let file_paths: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
@@ -628,6 +1054,58 @@ mod dedup_tests {
                 lines
             );
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A check that reports two findings at the same `(file, line, check_name)` that
+    /// differ only in their description — the shape produced by per-operator checks
+    /// like `unchecked-arithmetic` on a single source line.
+    struct DistinctSameLineCheck;
+    impl soroban_guard_checks::Check for DistinctSameLineCheck {
+        fn name(&self) -> &str {
+            "distinct-same-line"
+        }
+        fn run(&self, _file: &syn::File, _src: &str) -> Vec<Finding> {
+            let base = Finding {
+                check_name: "distinct-same-line".into(),
+                severity: Severity::Medium,
+                file_path: String::new(),
+                line: 3,
+                function_name: "f".into(),
+                description: String::new(),
+                rule_url: None,
+                suggestion: None,
+            };
+            vec![
+                Finding {
+                    description: "addition may overflow".into(),
+                    ..base.clone()
+                },
+                Finding {
+                    description: "multiplication may overflow".into(),
+                    ..base
+                },
+            ]
+        }
+    }
+
+    #[test]
+    fn keeps_distinct_findings_on_the_same_line() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-dedup-distinct-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        let checks: Vec<Box<dyn soroban_guard_checks::Check + Send + Sync>> =
+            vec![Box::new(DistinctSameLineCheck)];
+        let (results, _, _) = scan_directory_with_checks(&root, &[], &[], &checks).unwrap();
+
+        let total: usize = results.iter().map(|r| r.findings.len()).sum();
+        assert_eq!(total, 2, "distinct same-line findings must both survive dedup, got {total}");
 
         fs::remove_dir_all(root).unwrap();
     }

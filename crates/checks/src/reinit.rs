@@ -1,11 +1,10 @@
 //! Flags `initialize`/`init`/`setup` functions in `#[contractimpl]` that do not guard
 //! against being called more than once.
 
-use crate::util::contractimpl_functions;
+use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
 use crate::{Check, Finding, Severity};
-use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprMethodCall, File};
+use syn::{ExprMethodCall, File};
 
 const CHECK_NAME: &str = "re-initialization-risk";
 
@@ -18,7 +17,7 @@ impl Check for ReInitializationRiskCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             if !is_init_fn(&fn_name) {
                 continue;
@@ -58,19 +57,6 @@ fn is_init_fn(name: &str) -> bool {
     name.contains("init") || name.contains("setup")
 }
 
-fn receiver_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "storage" {
-                return true;
-            }
-            receiver_chain_contains_storage(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_storage(&f.base),
-        _ => false,
-    }
-}
-
 #[derive(Default)]
 struct BodyScan {
     has_storage_write: bool,
@@ -83,7 +69,11 @@ impl<'ast> Visit<'ast> for BodyScan {
         if method == "set" && receiver_chain_contains_storage(&i.receiver) {
             self.has_storage_write = true;
         }
-        if matches!(method.as_str(), "has" | "is_some" | "is_none") {
+        if matches!(method.as_str(), "has" | "is_some" | "is_none")
+            && receiver_chain_contains_storage(&i.receiver)
+        {
+            // Only counts as a re-init guard when the check is performed against storage
+            // (e.g. `env.storage().instance().has(&key)`), not an unrelated Option/collection.
             self.has_guard = true;
         }
         visit::visit_expr_method_call(self, i);
@@ -100,5 +90,69 @@ impl<'ast> Visit<'ast> for BodyScan {
             self.has_guard = true;
         }
         visit::visit_macro(self, i);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Check;
+    use syn::parse_file;
+
+    fn run(src: &str) -> Vec<Finding> {
+        let file = parse_file(src).expect("parse");
+        ReInitializationRiskCheck.run(&file, src)
+    }
+
+    #[test]
+    fn flags_init_with_unrelated_is_some_and_unconditional_write() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn initialize(env: Env, admin: Address, referrer: Option<Address>) {
+        if referrer.is_some() {
+            // unrelated referral logic
+        }
+        env.storage().instance().set(&0, &admin);
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].check_name, CHECK_NAME);
+    }
+
+    #[test]
+    fn passes_when_storage_has_guard_gates_write() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&0) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&0, &admin);
+    }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn flags_init_without_any_guard() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn initialize(env: Env, admin: Address) {
+        env.storage().instance().set(&0, &admin);
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
     }
 }

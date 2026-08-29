@@ -1,6 +1,6 @@
 //! Integer-division-truncation: `/` and `/=` on non-literal operands.
 
-use crate::util::contractimpl_functions;
+use crate::util::contractimpl_functions_excluding_test;
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -19,7 +19,7 @@ impl Check for IntegerDivisionTruncationCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             let mut v = DivVisitor {
                 fn_name: fn_name.clone(),
@@ -68,7 +68,11 @@ impl Visit<'_> for DivVisitor<'_> {
                     "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#integer-division-truncation-medium"
                         .to_string(),
                 ),
-                suggestion: None,
+                suggestion: Some(
+                    "Use `checked_div` and handle the `None` case, or document the rounding \
+                     direction explicitly (e.g. floor vs. ceiling) with a comment."
+                        .to_string(),
+                ),
             });
         }
         visit::visit_expr_binary(self, i);

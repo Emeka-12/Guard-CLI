@@ -1,4 +1,5 @@
 use crate::{Check, Finding, Severity};
+use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Expr, ImplItem, ItemImpl};
 
@@ -31,7 +32,7 @@ impl<'ast> Visit<'ast> for LoopVisitor {
 
         for item in &node.items {
             if let ImplItem::Fn(method) = item {
-                if self.in_contractimpl && method.sig.vis.is_pub() {
+                if self.in_contractimpl && matches!(method.vis, syn::Visibility::Public(_)) {
                     let mut loop_visitor = LoopFinder::default();
                     visit::visit_block(&mut loop_visitor, &method.block);
 
@@ -46,7 +47,10 @@ impl<'ast> Visit<'ast> for LoopVisitor {
                                 "Unbounded {} loop can exhaust compute budget",
                                 loop_type
                             ),
-                            rule_url: None,
+                            rule_url: Some(
+                                "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#large-loop-medium"
+                                    .to_string(),
+                            ),
                             suggestion: Some(
                                 "Use bounded iteration or add explicit break conditions"
                                     .to_string(),
@@ -88,6 +92,9 @@ impl<'ast> Visit<'ast> for LoopFinder {
             }
             Expr::While(_) => {
                 self.loops.push((node.span().start().line, "while".to_string()));
+            }
+            Expr::ForLoop(_) => {
+                self.loops.push((node.span().start().line, "for".to_string()));
             }
             _ => {}
         }

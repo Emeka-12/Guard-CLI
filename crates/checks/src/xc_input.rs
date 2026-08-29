@@ -4,7 +4,7 @@
 //! `env.storage().*.set(…, &binding)` without any intervening `if`, `match`, or
 //! `unwrap_or*` / `ok_or*` / `checked_*` call.
 
-use crate::util::contractimpl_functions;
+use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
 use crate::{Check, Finding, Severity};
 use std::collections::HashSet;
 use syn::spanned::Spanned;
@@ -22,7 +22,7 @@ impl Check for UnsafeCrossContractInputCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             let mut v = XcInputVisitor {
                 fn_name,
@@ -60,18 +60,6 @@ fn is_invoke_contract(e: &Expr) -> bool {
     }
 }
 
-fn receiver_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "storage" {
-                return true;
-            }
-            receiver_chain_contains_storage(&m.receiver)
-        }
-        _ => false,
-    }
-}
-
 fn is_storage_set(m: &ExprMethodCall) -> bool {
     m.method == "set" && receiver_chain_contains_storage(&m.receiver)
 }
@@ -88,9 +76,14 @@ impl<'ast> Visit<'ast> for XcInputVisitor<'ast> {
         // Collect `let <ident> = …invoke_contract(…)` bindings.
         if let Stmt::Local(local) = stmt {
             if let Some(init) = &local.init {
-                if is_invoke_contract(&init.expr) {
-                    if let Pat::Ident(pi) = &local.pat {
+                if let Pat::Ident(pi) = &local.pat {
+                    if is_invoke_contract(&init.expr) {
+                        // New tainted binding.
                         self.xc_bindings.insert(pi.ident.to_string());
+                    } else {
+                        // Re-binding under the same name to a non-invoke value clears any
+                        // prior taint: the variable has been validated/transformed.
+                        self.xc_bindings.remove(&pi.ident.to_string());
                     }
                 }
             }
@@ -120,7 +113,12 @@ impl<'ast> Visit<'ast> for XcInputVisitor<'ast> {
                                 "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unsafe-cross-contract-input-high"
                                     .to_string(),
                             ),
-                            suggestion: None,
+                            suggestion: Some(
+                                "Validate or sanitize the `invoke_contract` return value before \
+                                 storing it — e.g. bounds-check numeric results or match on an \
+                                 expected type/variant before calling `env.storage().*.set(…)`."
+                                    .to_string(),
+                            ),
                         });
                     }
                 }
@@ -195,6 +193,23 @@ pub struct C;
 impl C {
     pub fn store(env: Env, val: i128) {
         env.storage().persistent().set(&Symbol::short("k"), &val);
+    }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn passes_when_tainted_binding_is_shadowed_by_validated_value() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address, Symbol};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn relay(env: Env, callee: Address, sym: Symbol) {
+        let result = env.invoke_contract::<i128>(&callee, &sym, ());
+        let result = if result > 0 { result } else { 0 };
+        env.storage().persistent().set(&Symbol::short("k"), &result);
     }
 }
 "#);

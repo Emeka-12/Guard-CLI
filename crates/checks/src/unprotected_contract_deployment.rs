@@ -1,4 +1,5 @@
 use crate::{Check, Finding, Severity};
+use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{ImplItem, ItemImpl};
 
@@ -28,7 +29,7 @@ impl<'ast> Visit<'ast> for DeploymentVisitor {
         if has_contractimpl_attr(&node.attrs) {
             for item in &node.items {
                 if let ImplItem::Fn(method) = item {
-                    if method.sig.vis.is_pub() {
+                    if matches!(method.vis, syn::Visibility::Public(_)) {
                         let (has_deployer, line) = has_deployer_call(&method.block);
                         let has_auth = contains_auth_call(&method.block);
 
@@ -42,7 +43,10 @@ impl<'ast> Visit<'ast> for DeploymentVisitor {
                                 description:
                                     "Contract deployment call lacks require_auth protection"
                                         .to_string(),
-                                rule_url: None,
+                                rule_url: Some(
+                                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unprotected-contract-deployment-high"
+                                        .to_string(),
+                                ),
                                 suggestion: Some(
                                     "Add env.require_auth() before deployment operations"
                                         .to_string(),

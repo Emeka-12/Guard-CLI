@@ -13,6 +13,8 @@ pub mod hardcoded_address;
 pub mod invoke_return;
 pub mod key_collision;
 pub mod large_loop;
+pub mod missing_event_for_admin_change;
+pub mod missing_input_length_bound;
 pub mod missing_nonce;
 pub mod overflow;
 pub mod panics;
@@ -27,8 +29,12 @@ pub mod unsafe_randomness;
 pub mod vec_growth;
 pub mod xc_input;
 pub mod zero_address;
+pub mod unchecked_token_amount;
 pub mod uninitialized_storage_read;
-mod util;
+pub mod unprotected_contract_deployment;
+pub mod unprotected_token_mint;
+pub mod unprotected_upgrade;
+pub mod util;
 
 pub use admin::UnprotectedAdminCheck;
 pub use annotations::MissingContractAnnotationCheck;
@@ -43,6 +49,8 @@ pub use hardcoded_address::HardcodedAddressCheck;
 pub use invoke_return::UncheckedInvokeReturnCheck;
 pub use key_collision::SymbolKeyCollisionCheck;
 pub use large_loop::LargeLoopCheck;
+pub use missing_event_for_admin_change::MissingEventForAdminChangeCheck;
+pub use missing_input_length_bound::MissingInputLengthBoundCheck;
 pub use missing_nonce::MissingNonceCheck;
 pub use overflow::UncheckedArithmeticCheck;
 pub use panics::PanicInContractCheck;
@@ -57,17 +65,22 @@ pub use unsafe_randomness::UnsafeRandomnessCheck;
 pub use vec_growth::UnboundedVecGrowthCheck;
 pub use xc_input::UnsafeCrossContractInputCheck;
 pub use zero_address::MissingZeroAddressCheck;
+pub use unchecked_token_amount::UncheckedTokenAmountCheck;
 pub use uninitialized_storage_read::UninitializedStorageReadCheck;
+pub use unprotected_contract_deployment::UnprotectedContractDeploymentCheck;
+pub use unprotected_token_mint::UnprotectedTokenMintCheck;
+pub use unprotected_upgrade::UnprotectedUpgradeCheck;
 
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use syn::File;
 
 /// Severity of a finding.
 ///
 /// The `PartialOrd`/`Ord` implementation orders variants High → Medium → Low so
 /// that `BTreeMap<Severity, _>` naturally sorts from most to least severe.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     High,
@@ -176,21 +189,15 @@ pub fn group_by_severity<'a>(findings: &'a [Finding]) -> BTreeMap<Severity, Vec<
     map
 }
 
-/// All checks executed by the analyzer (extend here as you add detectors).
+/// Base list of all built-in checks, using the plain (no-config) constructor for every check.
 ///
-/// Checks are **stateless and isolated**: implementations must not use shared
-/// mutable static state or assume a particular invocation order. The analyzer
-/// runs each check against the same parsed `syn::File` independently and
-/// concatenates `Finding`s.
-///
-/// # Panics
-///
-/// Panics immediately if any two checks share the same [`Check::name`] string.
-/// This catches copy-paste errors when adding a new detector before they can
-/// cause silent finding collisions at runtime.
-pub fn default_checks() -> Vec<Box<dyn Check + Send + Sync>> {
+/// This is the single source of truth for the check list. Both [`default_checks`] and
+/// [`default_checks_with_config`] derive their lists from this function so that adding or
+/// removing a check only requires editing one place.
+fn all_checks_base() -> Vec<Box<dyn Check + Send + Sync>> {
     vec![
         Box::new(MissingRequireAuthCheck),
+        Box::new(AuthAfterStorageWriteCheck),
         Box::new(UncheckedArithmeticCheck),
         Box::new(UnprotectedAdminCheck::new()),
         Box::new(UnsafeStoragePatternsCheck),
@@ -212,7 +219,44 @@ pub fn default_checks() -> Vec<Box<dyn Check + Send + Sync>> {
         Box::new(UnboundedVecGrowthCheck),
         Box::new(UnsafeRandomnessCheck),
         Box::new(UncheckedDivisorCheck),
+        Box::new(PanicInContractCheck),
+        Box::new(UnprotectedUpgradeCheck),
+        Box::new(UnprotectedTokenMintCheck),
+        Box::new(UnprotectedContractDeploymentCheck),
+        Box::new(UncheckedTokenAmountCheck),
+        Box::new(LargeLoopCheck),
+        Box::new(MissingNonceCheck),
+        Box::new(UninitializedStorageReadCheck),
+        Box::new(ReentrancyRiskCheck),
+        Box::new(MissingEventForAdminChangeCheck),
+        Box::new(MissingInputLengthBoundCheck),
     ]
+}
+
+fn ensure_unique_check_names(checks: &[Box<dyn Check + Send + Sync>]) {
+    let mut names = HashSet::new();
+    for check in checks {
+        let name = check.name();
+        assert!(names.insert(name), "duplicate check name: {name}");
+    }
+}
+
+/// All checks executed by the analyzer (extend here as you add detectors).
+///
+/// Checks are **stateless and isolated**: implementations must not use shared
+/// mutable static state or assume a particular invocation order. The analyzer
+/// runs each check against the same parsed `syn::File` independently and
+/// concatenates `Finding`s.
+///
+/// # Panics
+///
+/// Panics immediately if any two checks share the same [`Check::name`] string.
+/// This catches copy-paste errors when adding a new detector before they can
+/// cause silent finding collisions at runtime.
+pub fn default_checks() -> Vec<Box<dyn Check + Send + Sync>> {
+    let checks = all_checks_base();
+    ensure_unique_check_names(&checks);
+    checks
 }
 
 /// Like [`default_checks`] but applies config-file settings:
@@ -224,6 +268,7 @@ pub fn default_checks_with_config(
 ) -> Vec<Box<dyn Check + Send + Sync>> {
     let mut checks: Vec<Box<dyn Check + Send + Sync>> = vec![
         Box::new(MissingRequireAuthCheck),
+        Box::new(AuthAfterStorageWriteCheck),
         Box::new(UncheckedArithmeticCheck),
         Box::new(UnprotectedAdminCheck::with_extra_names(extra_sensitive_names.to_vec())),
         Box::new(UnsafeStoragePatternsCheck),
@@ -245,7 +290,89 @@ pub fn default_checks_with_config(
         Box::new(UnboundedVecGrowthCheck),
         Box::new(UnsafeRandomnessCheck),
         Box::new(UncheckedDivisorCheck),
+        Box::new(PanicInContractCheck),
+        Box::new(UnprotectedUpgradeCheck),
+        Box::new(UnprotectedTokenMintCheck),
+        Box::new(UnprotectedContractDeploymentCheck),
+        Box::new(UncheckedTokenAmountCheck),
+        Box::new(LargeLoopCheck),
+        Box::new(MissingNonceCheck),
+        Box::new(UninitializedStorageReadCheck),
+        Box::new(ReentrancyRiskCheck),
+        Box::new(MissingEventForAdminChangeCheck),
+        Box::new(MissingInputLengthBoundCheck),
     ];
     checks.retain(|c| !disabled.contains(&c.name().to_string()));
+    ensure_unique_check_names(&checks);
     checks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_checks, ensure_unique_check_names, Check, MissingRequireAuthCheck};
+    use syn::parse_file;
+
+    const VULNERABLE_FIXTURES: &[&str] = &[
+        include_str!("../../../test-contracts/admin-event-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/admin-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/arithmetic-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/auth-order-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/balance-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/contract-annotation-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/contract-deployment-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/delegate-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/division-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/event-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/global-state-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/hardcoded-address-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/input-length-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/invoke-return-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/key-collision-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/large-loop-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/nonce-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/panic-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/reentrancy-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/reinit-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/self-transfer-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/std-imports-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/storage-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/token-amount-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/token-mint-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/ttl-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/unchecked-divisor-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/uninitialized-storage-read-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/unsafe-randomness-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/upgrade-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/vec-growth-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/xc-input-vulnerable/src/lib.rs"),
+        include_str!("../../../test-contracts/zero-address-vulnerable/src/lib.rs"),
+    ];
+
+    #[test]
+    fn findings_from_default_checks_have_rule_urls() {
+        let checks = default_checks();
+
+        for source in VULNERABLE_FIXTURES {
+            let file = parse_file(source).expect("fixture should parse");
+            for check in &checks {
+                for finding in check.run(&file, source) {
+                    assert!(
+                        finding.rule_url.is_some(),
+                        "check {} emitted a finding without rule_url",
+                        finding.check_name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate check name: missing-require-auth")]
+    fn duplicate_check_names_panic() {
+        let checks: Vec<Box<dyn Check + Send + Sync>> = vec![
+            Box::new(MissingRequireAuthCheck),
+            Box::new(MissingRequireAuthCheck),
+        ];
+        ensure_unique_check_names(&checks);
+    }
 }

@@ -1,6 +1,6 @@
 //! Reentrancy-risk: `invoke_contract` after a storage write without a re-read.
 
-use crate::util::contractimpl_functions;
+use crate::util::contractimpl_functions_excluding_test;
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -20,7 +20,7 @@ impl Check for ReentrancyRiskCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             let mut v = ReentrancyVisitor::default();
             v.visit_block(&method.block);
@@ -41,7 +41,12 @@ impl Check for ReentrancyRiskCheck {
                         "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#reentrancy-risk-high"
                             .to_string(),
                     ),
-                    suggestion: None,
+                    suggestion: Some(format!(
+                        "Move all `env.storage().*.set(…)` calls in `{fn_name}` to \
+                         *after* the `invoke_contract` call (checks-effects-interactions \
+                         pattern), or re-read and re-validate state immediately after \
+                         the external call returns."
+                    )),
                 });
             }
         }
@@ -97,10 +102,12 @@ impl<'ast> Visit<'ast> for ReentrancyVisitor {
             self.re_read_after_write = false;
         } else if self.wrote && is_storage_read(i) {
             self.re_read_after_write = true;
-        } else if self.wrote && !self.re_read_after_write && is_invoke_contract(i) {
-            if self.invoke_after_write_line.is_none() {
-                self.invoke_after_write_line = Some(i.span().start().line);
-            }
+        } else if self.wrote
+            && !self.re_read_after_write
+            && is_invoke_contract(i)
+            && self.invoke_after_write_line.is_none()
+        {
+            self.invoke_after_write_line = Some(i.span().start().line);
         }
         visit::visit_expr_method_call(self, i);
     }

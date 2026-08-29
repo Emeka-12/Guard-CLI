@@ -1,6 +1,8 @@
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
+use quote::ToTokens;
 use syn::{ExprMethodCall, Block};
+
 
 const CHECK_NAME: &str = "unchecked-token-amount";
 const TRANSFER_METHODS: &[&str] = &["transfer", "transfer_from", "xfer", "mint"];
@@ -23,9 +25,16 @@ impl Check for UncheckedTokenAmountCheck {
 struct TokenAmountVisitor {
     findings: Vec<Finding>,
     current_block: Option<Box<Block>>,
+    current_function: String,
 }
 
 impl<'ast> Visit<'ast> for TokenAmountVisitor {
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        let prev = std::mem::replace(&mut self.current_function, node.sig.ident.to_string());
+        visit::visit_impl_item_fn(self, node);
+        self.current_function = prev;
+    }
+
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method_name = node.method.to_string();
         if TRANSFER_METHODS.iter().any(|&m| method_name.contains(m)) {
@@ -35,12 +44,15 @@ impl<'ast> Visit<'ast> for TokenAmountVisitor {
                         check_name: CHECK_NAME.to_string(),
                         severity: Severity::Medium,
                         file_path: String::new(),
-                        line: node.span().start().line,
-                        function_name: String::new(),
+                        line: node.method.span().start().line,
+                        function_name: self.current_function.clone(),
                         description:
                             "Token transfer amount is not validated to be greater than zero"
                                 .to_string(),
-                        rule_url: None,
+                        rule_url: Some(
+                            "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unchecked-token-amount-medium"
+                                .to_string(),
+                        ),
                         suggestion: Some(
                             "Validate amount > 0 before transfer call".to_string(),
                         ),

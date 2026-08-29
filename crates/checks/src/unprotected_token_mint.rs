@@ -1,6 +1,8 @@
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
+use syn::spanned::Spanned;
 use syn::{ImplItem, ItemImpl};
+
 
 const CHECK_NAME: &str = "unprotected-token-mint";
 const MINT_NAMES: &[&str] = &["mint", "burn", "issue", "redeem", "create_tokens"];
@@ -30,7 +32,7 @@ impl<'ast> Visit<'ast> for MintVisitor {
             for item in &node.items {
                 if let ImplItem::Fn(method) = item {
                     let name = method.sig.ident.to_string();
-                    if is_mint_name(&name) && method.sig.vis.is_pub() {
+                    if is_mint_name(&name) && matches!(method.vis, syn::Visibility::Public(_)) {
                         let has_auth = contains_auth_call(&method.block);
                         if !has_auth {
                             self.findings.push(Finding {
@@ -43,7 +45,10 @@ impl<'ast> Visit<'ast> for MintVisitor {
                                     "Mint/burn method `{}` lacks require_auth call",
                                     name
                                 ),
-                                rule_url: None,
+                                rule_url: Some(
+                                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unprotected-token-mint-high"
+                                        .to_string(),
+                                ),
                                 suggestion: Some(
                                     "Add env.require_auth() to restrict minting to authorized callers"
                                         .to_string(),

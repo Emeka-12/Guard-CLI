@@ -1,0 +1,7 @@
+# Security-sensitive files require maintainer review
+crates/checks/src/ @SorobanGuard/maintainers
+crates/analyzer/src/ @SorobanGuard/maintainers
+crates/cli/src/ @SorobanGuard/maintainers
+SECURITY.md @SorobanGuard/maintainers
+.github/workflows/ @SorobanGuard/maintainers
+Cargo.lock @SorobanGuard/maintainers

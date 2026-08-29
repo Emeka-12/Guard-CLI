@@ -12,7 +12,7 @@ This document describes what each Soroban Guard Core check looks for and why it 
 
 In an `impl` block marked with `#[contractimpl]` or `#[soroban_sdk::contractimpl]`, any function whose body:
 
-1. Performs a storage mutation through `env.storage()` (heuristic: method calls `set`, `remove`, `extend_ttl`, `bump`, or `append` on a receiver chain that includes `.storage()`), and  
+1. Performs a storage mutation through `env.storage()` (heuristic: method s `set`, `remove`, `extend_ttl`, `bump`, or `append` on a receiver chain that includes `.storage()`), and  
 2. Never calls `env.require_auth()` (parameter name **`env`**: `env.require_auth()`).
 
 **Why it matters**
@@ -25,6 +25,45 @@ Contract state updates should be gated. This rule recognizes both `env.require_a
 - Static analysis cannot see auth hidden in helpers.
 
 **Fixture:** `test-contracts/vulnerable/`, `test-contracts/safe/`
+
+---
+
+## `auth-after-storage-write` (High)
+
+**Status:** Phase 1
+
+**What it detects**
+
+In a `#[contractimpl]` method, a storage mutation through `env.storage()` (`set`, `remove`, `extend_ttl`, `bump`, or `append`) occurs before any call to `env.require_auth()` or `env.require_auth_for_args()` on the same `Env` binding.
+
+**Why it matters**
+
+Authorization should happen before state mutation. If a contract writes to storage before requiring auth, an attacker may influence state changes without being authorized.
+
+**Example**
+
+```rust
+#[contractimpl]
+impl Contract {
+	pub fn update(env: Env, value: u32) {
+		env.storage().instance().set(&symbol_short!("value"), &value);
+		env.require_auth(); // Finding: authorization follows the write.
+	}
+
+	pub fn update_safely(env: Env, value: u32) {
+		env.require_auth();
+		env.storage().instance().set(&symbol_short!("value"), &value);
+	}
+}
+```
+
+**Limitations**
+
+- Only the `Env` binding named `env` or the explicit environment parameter name is recognized.
+- Static analysis cannot see auth enforced inside helper functions or via dataflow beyond the method body.
+- The check compares the first storage write with the first auth call in source order; complex branching may produce a finding even when every runtime path authorizes before writing.
+
+**Fixture:** `test-contracts/auth-order-vulnerable/`, `test-contracts/auth-order-safe/`
 
 ---
 
@@ -104,13 +143,34 @@ Names like `set_owner` strongly suggest privilege; without any auth call the sca
 
 ---
 
+## `forbidden-std-imports` (High)
+
+**Status:** Phase 2
+
+**What it detects**
+
+Files that contain `#[contract]` or `#[contractimpl]` and also import from `std` with paths such as `use std::...` or `use ::std::...`.
+
+**Why it matters**
+
+Soroban contracts compile to WASM with `#![no_std]`. Importing from `std` causes a compile error for WASM targets and indicates that the contract cannot be deployed as-is.
+
+**Limitations**
+
+- This is a file-level check only.
+- It does not detect transitive `std` usage through re-exported types.
+
+**Fixture:** To be added; see issue #117.
+
+---
+
 ## `hardcoded-address` (Medium)
 
 **Status:** Phase 3
 
 **What it detects**
 
-A string literal anywhere in the file that matches the shape of a Stellar `StrKey` public key — a 56-character base32 run starting with `G`, bounded by non-alphanumeric characters on both sides. Works on the raw source text rather than the parsed AST, so it catches keys regardless of which expression they appear in.
+A string literal anywhere in the file that matches the shape of a Stellar `StrKey` address — a 56-character base32 run starting with `G` (Ed25519 public key) or `C` (Soroban contract address), bounded by non-alphanumeric characters on both sides. Works on the raw source text rather than the parsed AST, so it catches addresses regardless of which expression they appear in.
 
 **Why it matters**
 
@@ -118,7 +178,7 @@ Baking a fixed account or contract address into source code breaks the contract 
 
 **Limitations**
 
-- Purely textual pattern matching — it does not verify the candidate is a valid `StrKey` checksum, so it can flag any 56-char `G...` run, including ones in comments or non-address strings that happen to match the shape.
+- Purely textual pattern matching — it does not verify the candidate is a valid `StrKey` checksum, so it can flag any 56-char `G...` or `C...` run, including ones in comments or non-address strings that happen to match the shape.
 - Does not track whether the literal is actually used to construct an `Address` (e.g. via `Address::from_str`) vs. just printed or compared.
 
 **Fixture:** `test-contracts/hardcoded-address-vulnerable/`, `test-contracts/hardcoded-address-safe/`
@@ -202,7 +262,6 @@ Inside a single `#[contractimpl]` method: a storage write (`set`, `remove`, `ext
 
 - Tracks a single, linear path through one method body; writes and calls reached through different branches of an `if`/`match`, or made from a helper function, are not correlated.
 - A storage read anywhere after the write clears the finding, even if it doesn't actually re-validate the state used by the subsequent `invoke_contract` call.
-- This check is implemented and unit-tested but not yet included in `default_checks()` — it does not currently run as part of a default `soroban-guard` scan.
 
 **Fixture:** tests in `crates/checks/src/reentrancy.rs`
 
@@ -267,7 +326,7 @@ Duplicate storage keys cause silent overwrites. Two contract functions writing d
 - Only compares keys that share the same `#[contractimpl]` block; cross-block duplicates are not detected.
 - Only `symbol_short!` is analyzed; `Symbol::new` with the same string literal is not matched.
 
-**Fixture:** `test-contracts/key-collision-vulnerable/`, `test-contracts/key-collision-safe/`
+**Fixture:** Covered by inline `#[cfg(test)]` unit tests in `crates/checks/src/key_collision.rs`.
 
 ---
 
@@ -288,7 +347,7 @@ Self-transfers waste ledger space, waste the caller's gas, and may indicate a lo
 - Guard detection is structural (presence of a comparison expression in the body); complex guard logic may not be recognized.
 - Only functions with "transfer" or "send" in the name are inspected.
 
-**Fixture:** `test-contracts/transfer-vulnerable/`, `test-contracts/transfer-safe/`
+**Fixture:** `test-contracts/self-transfer-vulnerable/`, `test-contracts/self-transfer-safe/`
 
 ---
 
@@ -357,7 +416,7 @@ Without a one-time guard, an attacker can call `initialize` again to overwrite t
 
 **What it detects**
 
-Inside `#[contractimpl]` methods, any call to `env.invoke_contract(…)` that appears as a standalone expression statement (semicolon-terminated, not bound to a variable), meaning the return value is silently discarded.
+Inside `#[contractimpl]` methods, any call to `env.invoke_contract(…)` or `env.invoke_contract_check(…)` whose return value is silently discarded (standalone expression statement, bound to `_`, or bound to an unreferenced variable).
 
 **Why it matters**
 
@@ -365,10 +424,10 @@ Cross-contract calls may fail. Discarding the return value silently swallows err
 
 **Limitations**
 
-- Only flags the syntactic pattern of a bare statement; does not track data flow.
-- `let _ = env.invoke_contract(…);` suppresses the warning even though the value is technically dropped.
+- Only flags discarded or unreferenced return value bindings; does not track complex data flow.
 
 **Fixture:** `test-contracts/invoke-return-vulnerable/`, `test-contracts/invoke-return-safe/`
+
 
 ---
 
@@ -388,6 +447,28 @@ Attempting a transfer without verifying the sender has sufficient funds can caus
 - Does not verify that the balance check precedes the transfer in control flow.
 
 **Fixture:** `test-contracts/balance-vulnerable/`, `test-contracts/balance-safe/`
+
+---
+
+## `unprotected-token-mint` (High)
+
+**Status:** Phase 3
+
+**What it detects**
+
+Public (`pub fn`) methods in `#[contractimpl]` whose name contains `mint`, `burn`, `issue`, `redeem`, or `create_tokens`, and whose body contains **no** call to `require_auth` or `require_auth_for_args` on any receiver.
+
+**Why it matters**
+
+Token supply operations are among the most sensitive entrypoints in a Soroban contract. Without an auth gate, any account on the Stellar network can call `mint` or `burn` directly, inflating or destroying token balances at will. This is an immediate economic exploit — comparable to a printable-money bug — and is essentially irreversible once the transaction hits the ledger.
+
+**Limitations**
+
+- Name-based heuristic only: functions that perform minting logic under a different name (e.g. `distribute`, `award`) are not detected.
+- Any `require_auth` / `require_auth_for_args` call anywhere in the method body clears the finding, even if it is inside a branch that is never reached in practice.
+- Does not verify that the caller being authenticated is actually a trusted admin; a contract that calls `require_auth()` on the wrong address still passes this check.
+
+**Fixture:** `test-contracts/token-mint-vulnerable/`, `test-contracts/token-mint-safe/`
 
 ---
 
@@ -458,10 +539,220 @@ Inside `#[contractimpl]` methods: explicit `panic!()` and `unreachable!()` macro
 
 Panics abort the transaction with an unhelpful, generic error and can leave the contract in a partially-updated state if some storage writes already happened earlier in the call. Prefer `Result`-returning methods with typed errors, or `env.panic_with_error` for explicit, well-defined aborts.
 
+**Relationship to `uninitialized-storage-read`**
+
+`.unwrap()`/`.expect(...)` chained directly onto a storage `.get(...)`/`.get_unchecked(...)` call (e.g. `env.storage().persistent().get(&K).unwrap()`) is **not** flagged here — that exact pattern is reported once, as the more specific and more severe [`uninitialized-storage-read`](#uninitialized-storage-read-high) finding, instead of being double-reported by both checks.
+
 **Limitations**
 
 - Does not track `unwrap`/`expect` through re-exports or type aliases — only the literal method name is matched.
 - Flags every occurrence regardless of whether the `Option`/`Result` being unwrapped is realistically `None`/`Err` (e.g. immediately after a guarded check).
-- This check is implemented and unit-tested but not yet included in `default_checks()` — it does not currently run as part of a default `soroban-guard` scan.
 
 **Fixture:** `test-contracts/panic-vulnerable/`, `test-contracts/panic-safe/`
+
+---
+
+## `missing-ttl-extension` (Low)
+
+**What it detects**
+
+In `#[contractimpl]` methods, writes to persistent storage (`env.storage().persistent().set(...)`, `remove(...)`, or `append(...)`) that are not followed by an `env.storage().persistent().extend_ttl(...)` call in the same function.
+
+**Why it matters**
+
+Persistent contract storage entries eventually expire. Without an explicit TTL extension, the ledger can archive the data and later reads may fail or behave unexpectedly.
+
+**Limitations**
+
+- Only checks for direct persistent writes and TTL extension calls in the same function body.
+- Does not analyze helper functions or control-flow paths that extend TTL elsewhere.
+
+**Fixture:** `test-contracts/ttl-vulnerable/`, `test-contracts/ttl-safe/`
+
+---
+
+## `missing-input-length-bound` (Medium)
+
+**What it detects**
+
+Public methods inside `#[contractimpl]` impl blocks that accept a `Bytes` or `Vec` parameter without a `.len()` or `.is_empty()` check for that parameter in the method body.
+
+**Why it matters**
+
+Unbounded caller-provided collections can make a contract perform excessive work or consume more resources than expected. Checking the input length and rejecting values above the contract's intended maximum helps keep execution and storage costs predictable.
+
+**Example**
+
+```rust
+#[contractimpl]
+impl Contract {
+	pub fn process(env: Env, data: Bytes) {
+		// Finding: data is used without a length check.
+		env.storage().instance().set(&symbol_short!("data"), &data);
+	}
+
+	pub fn process_bounded(env: Env, data: Bytes) {
+		if data.len() > 1024 {
+			panic!("input too large");
+		}
+		env.storage().instance().set(&symbol_short!("data"), &data);
+	}
+}
+```
+
+**Limitations and known false positives**
+
+- The check is syntactic: any `.len()` or `.is_empty()` call on the parameter clears the finding, even if it does not enforce a useful maximum or minimum.
+- It does not infer collection types beyond the `Bytes`/`Vec` text matched by the detector, and type aliases may be missed or misclassified.
+- Validation performed in a helper function is not visible to this check.
+
+**Fixture:** tests in `crates/checks/src/missing_input_length_bound.rs`
+
+---
+
+## `large-loop` (Medium)
+
+**What it detects**
+
+Inside `#[contractimpl]` public methods: `loop { … }`, `while <cond> { … }`, or `for <pattern> in <expr> { … }` constructs. The check treats every loop expression as potentially large or unbounded.
+
+**Why it matters**
+
+Soroban contracts run under a fixed compute-budget cap. An unbounded loop can exhaust the budget in a single invocation, causing the transaction to abort. In adversarial scenarios a caller can craft inputs that trigger worst-case iteration counts, turning the contract into a denial-of-service vector against itself.
+
+**Limitations**
+
+- Does not distinguish loops with a provably finite iteration count (e.g. `while i < 10`) from genuinely unbounded ones — all `loop`, `while`, and `for` constructs are flagged.
+- It does not estimate collection size or iteration count, so a bounded `for` loop may still be reported.
+- Loops inside private helper functions called from a `#[contractimpl]` method are not detected.
+
+**Fixture:** `test-contracts/large-loop-vulnerable/`, `test-contracts/large-loop-safe/`
+
+---
+
+## `missing-nonce` (Medium)
+
+**What it detects**
+
+Public methods in `#[contractimpl]` that:
+
+1. Accept at least one `Address` parameter, and
+2. Perform a storage write (`set`, `remove`, `append`, `push`, or `push_back`), and
+3. Contain no reference to a nonce or replay-protection identifier — specifically, no identifier matching `nonce`, `sequence`, `seq_num`, or `replay` in the function body.
+
+**Why it matters**
+
+Off-chain-signed meta-transactions (e.g. permit-style flows, delegated actions) must include a nonce or sequence number to prevent replay attacks. Without one, an observer can re-submit a valid signed payload to repeat the state-mutating operation indefinitely on behalf of the signer.
+
+**Limitations**
+
+- Detection is purely identifier-based; a nonce stored under a differently-named variable (e.g. `counter`, `ts`) will not clear the finding.
+- Does not verify that the nonce value is actually checked or incremented — only that a recognised keyword appears in the function body.
+- Validation done inside a helper function called from the flagged method is not visible to this check.
+
+**Fixture:** `test-contracts/nonce-vulnerable/`, `test-contracts/nonce-safe/`
+
+---
+
+## `uninitialized-storage-read` (High)
+
+**What it detects**
+
+In `#[contractimpl]` methods: a storage read (`.storage().<tier>().get(...)` or `.get_unchecked(...)`) with `.unwrap()` or `.expect(...)` chained directly onto it, with no prior `has()` guard.
+
+**Why it matters**
+
+Reading uninitialized storage in Soroban returns `None`; calling `.unwrap()` or `.expect(...)` on it panics and aborts the contract invocation. This is a high-severity failure mode because it can brick a contract for legitimate callers or be triggered intentionally by an attacker to cause a denial of service.
+
+**Relationship to `panic-in-contract`**
+
+This check owns the `storage.get(...).unwrap()`/`.expect(...)` pattern exclusively: [`panic-in-contract`](#panic-in-contract-medium) explicitly skips `.unwrap()`/`.expect(...)` calls chained onto a storage read so the same line isn't reported twice under two different check names.
+
+**Limitations**
+
+- Only flags `.unwrap()`/`.expect(...)` chained directly onto the `.get(...)` call; a read stored in an intermediate variable before unwrapping is not tracked.
+- Does not check whether a preceding `has()` guard exists earlier in the function body.
+
+**Fixture:** tests in `crates/checks/src/uninitialized_storage_read.rs`
+
+---
+
+## `unprotected-upgrade` (High)
+
+**What it detects**
+
+In an `impl` block marked with `#[contractimpl]`, a `pub fn` whose name contains `upgrade`, `migrate`, `set_wasm`, or `replace_wasm`, and whose body contains no call to `require_auth` or `require_auth_for_args`.
+
+**Why it matters**
+
+Upgrade and migration entrypoints replace the contract's executable code. Without an authorization check, any caller could push arbitrary WASM, taking full control of the contract.
+
+**Relationship to `unprotected-admin`**
+
+[`unprotected-admin`](#unprotected-admin-high) also flags `upgrade` and `migrate` by exact name match against its `SENSITIVE_NAMES` list. This check is broader: it matches on substring (e.g. `set_wasm_hash`, `replace_wasm_v2`) rather than requiring an exact name, so the two checks can both report the same function.
+
+**Limitations**
+
+- Name-based matching only; an upgrade entrypoint with an unrelated name is not detected.
+- Any `require_auth` / `require_auth_for_args` call anywhere in the body clears the finding (no dataflow).
+
+**Fixture:** `test-contracts/upgrade-vulnerable/`, `test-contracts/upgrade-safe/`
+
+---
+
+## `unprotected-contract-deployment` (High)
+
+**What it detects**
+
+In a `#[contractimpl]` method, a call to `.deployer()` (e.g. `env.deployer().upload_contract_wasm(...)` or `env.deployer().deploy(...)`) with no call to `require_auth` or `require_auth_for_args` anywhere in the same method body.
+
+**Why it matters**
+
+Deploying or uploading contract WASM is a privileged operation. Without an authorization check, any caller could deploy arbitrary contracts through the flagged entrypoint, including on behalf of the contract itself.
+
+**Limitations**
+
+- Only detects `.deployer()` calls made directly in the method body; deployment logic delegated to a helper function is not visible to this check.
+- Any `require_auth` / `require_auth_for_args` call anywhere in the body clears the finding (no dataflow), even if it does not actually gate the deployer call.
+
+**Fixture:** `test-contracts/contract-deployment-vulnerable/`, `test-contracts/contract-deployment-safe/`
+
+---
+
+## `missing-event-for-admin-change` (Medium)
+
+**What it detects**
+
+Public admin-mutating functions inside `#[contractimpl]` whose name matches a sensitive set (`set_owner`, `set_admin`, `transfer_ownership`, `set_operator`) that write to storage via `set`, `remove`, or `append` but contain no call to `env.events().publish()`.
+
+**Why it matters**
+
+Administrative changes — transferring ownership, rotating operators, changing administrators — are among the most security-critical state transitions in a contract. Without an emitted event, off-chain monitors, indexers, and governance tools have no reliable way to observe or audit these transitions. Silent privilege escalation is difficult to detect after the fact.
+
+**Limitations**
+
+- Detection is name-based; admin functions with non-standard names (e.g. `update_controller`) are not flagged.
+- Any `publish` call anywhere in the method body clears the finding, even if it is for an unrelated event.
+- Events emitted inside helper functions called by the flagged method are not tracked.
+
+**Fixture:** tests in `crates/checks/src/missing_event_for_admin_change.rs`
+
+---
+
+## `unchecked-token-amount` (Medium)
+
+**What it detects**
+
+In `#[contractimpl]` methods: calls to token transfer or mint-style functions (`transfer`, `transfer_from`, `xfer`, `mint`) where the function body contains no guard that validates the amount is greater than zero (e.g. a comparison expression, `assert!`, or `require!` involving the amount).
+
+**Why it matters**
+
+Passing a zero or negative token amount to a transfer or mint call can result in no-op state changes that silently bypass expected accounting logic, or — depending on the token implementation — an unexpected revert that leaves the contract in an inconsistent state. Explicit amount validation is a baseline defence for any financial operation.
+
+**Limitations**
+
+- Guard detection is heuristic: the check looks for a binary comparison or `assert`/`require`-style macro that references a variable named `amount`. Differently-named parameters or complex guard logic may not be recognized.
+- Does not verify that the guard precedes the transfer call in control flow, only that it appears somewhere in the function body.
+- Validation performed inside a helper function called by the flagged method is not visible to this check.
+
+**Fixture:** tests in `crates/checks/src/unchecked_token_amount.rs`

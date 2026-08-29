@@ -8,7 +8,7 @@
 //! (containing `.storage()`) exists alongside an `env.invoke_contract` / `env.try_call`,
 //! the method is flagged. This catches both inlined and variable-mediated patterns.
 
-use crate::util::contractimpl_functions;
+use crate::util::contractimpl_functions_excluding_test;
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -27,7 +27,7 @@ impl Check for DelegateCallRiskCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             let mut v = DelegateVisitor {
                 has_storage_read: false,
@@ -38,7 +38,7 @@ impl Check for DelegateCallRiskCheck {
                 if let Some(line) = v.last_invoke_contract_line {
                     out.push(Finding {
                         check_name: CHECK_NAME.to_string(),
-                        severity: Severity::Medium,
+                        severity: Severity::High,
                         file_path: String::new(),
                         line,
                         function_name: fn_name.to_string(),
@@ -48,8 +48,18 @@ impl Check for DelegateCallRiskCheck {
                              poisoned (e.g., via upgrade or temp-storage race), the call \
                              can be redirected to an attacker-controlled contract.",
                         ),
-                        rule_url: None,
+                        rule_url: Some(
+                            "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#delegate-call-risk-high"
+                                .to_string(),
+                        ),
                         suggestion: None,
+                        rule_url: None,
+                        suggestion: Some(
+                            "Pass the callee address as a verified parameter or store it under \
+                             an admin-controlled key; call `caller.require_auth()` before using \
+                             any storage-derived address in `env.invoke_contract`."
+                                .to_string(),
+                        ),
                     });
                 }
             }
@@ -128,7 +138,7 @@ impl C {
         )?;
         let hits = DelegateCallRiskCheck.run(&file, "");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].severity, Severity::Medium);
+        assert_eq!(hits[0].severity, Severity::High);
         Ok(())
     }
 

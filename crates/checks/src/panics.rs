@@ -1,10 +1,42 @@
 //! Panic-in-contract: `panic!`, `unwrap()`, `expect(…)`, `unreachable!()` in contract methods.
 
-use crate::util::contractimpl_functions;
+use crate::util::contractimpl_functions_excluding_test;
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Expr, ExprCall, ExprMethodCall, File};
+
+/// Returns true when `expr` is **exactly** `.get(…)`/`.get_unchecked(…)` chained directly onto a
+/// `.storage()` receiver chain — the same pattern that
+/// `uninitialized_storage_read::UninitializedStorageReadCheck` reports under its own, more
+/// specific, `uninitialized-storage-read` finding. Only that single-hop pattern is suppressed
+/// here so that `.unwrap()`/`.expect()` further downstream (e.g. on the result of
+/// `.checked_mul(…)` that was itself computed from a storage read) are still reported.
+///
+/// In other words: `storage.get(&k).unwrap()` → suppressed (owned by `uninitialized-storage-read`)
+///                 `storage.get(&k).unwrap_or(0).checked_mul(x).unwrap()` → NOT suppressed here
+fn is_storage_get(expr: &Expr) -> bool {
+    match expr {
+        Expr::MethodCall(m) => {
+            (m.method == "get" || m.method == "get_unchecked")
+                && receiver_chain_contains_storage(&m.receiver)
+        }
+        _ => false,
+    }
+}
+
+fn receiver_chain_contains_storage(expr: &Expr) -> bool {
+    match expr {
+        Expr::MethodCall(m) => {
+            if m.method == "storage" {
+                return true;
+            }
+            receiver_chain_contains_storage(&m.receiver)
+        }
+        Expr::Field(f) => receiver_chain_contains_storage(&f.base),
+        _ => false,
+    }
+}
 
 const CHECK_NAME: &str = "panic-in-contract";
 
@@ -19,7 +51,7 @@ impl Check for PanicInContractCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             let mut v = PanicVisitor {
                 fn_name: fn_name.clone(),
@@ -61,7 +93,11 @@ impl PanicVisitor<'_> {
                 "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#panic-in-contract-medium"
                     .to_string(),
             ),
-                suggestion: None,
+            suggestion: Some(
+                "Replace with `env.panic_with_error(&MyError::Variant)` or change the \
+                 return type to `Result<T, MyError>` and return `Err(…)` instead."
+                    .to_string(),
+            ),
         });
     }
 }
@@ -77,7 +113,7 @@ impl<'ast> Visit<'ast> for PanicVisitor<'_> {
 
     fn visit_expr_method_call(&mut self, i: &'ast ExprMethodCall) {
         let name = i.method.to_string();
-        if matches!(name.as_str(), "unwrap" | "expect") {
+        if matches!(name.as_str(), "unwrap" | "expect") && !is_storage_get(&i.receiver) {
             self.push(i.span().start().line, &format!(".{name}()"));
         }
         visit::visit_expr_method_call(self, i);
@@ -108,12 +144,12 @@ mod tests {
     #[test]
     fn flags_unwrap() {
         let hits = run(r#"
-use soroban_sdk::{contractimpl, Env, Symbol};
+use soroban_sdk::{contractimpl, Env};
 pub struct C;
 #[contractimpl]
 impl C {
-    pub fn f(env: Env) -> u32 {
-        env.storage().instance().get::<Symbol, u32>(&Symbol::new(&env, "k")).unwrap()
+    pub fn f(_env: Env) -> u32 {
+        Some(1u32).unwrap()
     }
 }
 "#);
@@ -124,12 +160,12 @@ impl C {
     #[test]
     fn flags_expect() {
         let hits = run(r#"
-use soroban_sdk::{contractimpl, Env, Symbol};
+use soroban_sdk::{contractimpl, Env};
 pub struct C;
 #[contractimpl]
 impl C {
-    pub fn f(env: Env) -> u32 {
-        env.storage().instance().get::<Symbol, u32>(&Symbol::new(&env, "k")).expect("missing")
+    pub fn f(_env: Env) -> u32 {
+        Some(1u32).expect("missing")
     }
 }
 "#);

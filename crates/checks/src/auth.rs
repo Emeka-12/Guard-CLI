@@ -1,6 +1,6 @@
 //! Missing `env.require_auth()` before storage writes in `#[contractimpl]` methods.
 
-use crate::util::contractimpl_functions;
+use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -19,9 +19,10 @@ impl Check for MissingRequireAuthCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let env_param = env_param_name(&method.sig);
-            let mut scan = FuncBodyScan::new(env_param.as_deref());
+            let address_params = address_param_names(&method.sig);
+            let mut scan = FuncBodyScan::new(env_param.as_deref(), address_params);
             scan.visit_block(&method.block);
             if !scan.storage_write || scan.env_require_auth || scan.auth_helper_called {
                 continue;
@@ -77,17 +78,26 @@ fn type_is_env(ty: &Type) -> bool {
     tp.path.segments.last().is_some_and(|s| s.ident == "Env")
 }
 
-fn receiver_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "storage" {
-                return true;
+fn type_is_address(ty: &Type) -> bool {
+    let Type::Path(tp) = ty else {
+        return false;
+    };
+    tp.path.segments.last().is_some_and(|s| s.ident == "Address")
+}
+
+fn address_param_names(sig: &syn::Signature) -> Vec<String> {
+    let mut names = Vec::new();
+    for arg in &sig.inputs {
+        let FnArg::Typed(pat_type) = arg else {
+            continue;
+        };
+        if type_is_address(&pat_type.ty) {
+            if let Pat::Ident(ident) = &*pat_type.pat {
+                names.push(ident.ident.to_string());
             }
-            receiver_chain_contains_storage(&m.receiver)
         }
-        Expr::Field(f) => receiver_chain_contains_storage(&f.base),
-        _ => false,
     }
+    names
 }
 
 fn is_storage_mutation_call(m: &ExprMethodCall) -> bool {
@@ -101,36 +111,48 @@ fn is_storage_mutation_call(m: &ExprMethodCall) -> bool {
     receiver_chain_contains_storage(&m.receiver)
 }
 
-fn is_env_require_auth(m: &ExprMethodCall, env_name: &str) -> bool {
+fn is_env_require_auth(m: &ExprMethodCall, env_name: &str, address_names: &[String]) -> bool {
     if m.method != "require_auth" && m.method != "require_auth_for_args" {
         return false;
     }
     match &*m.receiver {
-        Expr::Path(p) => p.path.is_ident(env_name),
+        Expr::Path(p) => {
+            if p.path.is_ident(env_name) {
+                return true;
+            }
+            for addr in address_names {
+                if p.path.is_ident(addr) {
+                    return true;
+                }
+            }
+            false
+        }
         _ => false,
     }
 }
 
-fn is_auth_helper_method_call(m: &ExprMethodCall, env_name: &str) -> bool {
+fn is_auth_helper_method_call(m: &ExprMethodCall, env_name: &str, address_names: &[String]) -> bool {
     let name = m.method.to_string();
     name.starts_with("assert_auth")
         || name.starts_with("check_auth")
         || (name.starts_with("require_auth")
-            && !is_env_require_auth(m, env_name)
+            && !is_env_require_auth(m, env_name, address_names)
             && !matches!(&*m.receiver, Expr::Path(_)))
 }
 
 struct FuncBodyScan {
     env_name: String,
+    address_names: Vec<String>,
     storage_write: bool,
     env_require_auth: bool,
     auth_helper_called: bool,
 }
 
 impl FuncBodyScan {
-    fn new(env_name: Option<&str>) -> Self {
+    fn new(env_name: Option<&str>, address_names: Vec<String>) -> Self {
         Self {
             env_name: env_name.unwrap_or("env").to_string(),
+            address_names,
             storage_write: false,
             env_require_auth: false,
             auth_helper_called: false,
@@ -143,10 +165,10 @@ impl<'ast> Visit<'ast> for FuncBodyScan {
         if is_storage_mutation_call(i) {
             self.storage_write = true;
         }
-        if is_env_require_auth(i, &self.env_name) {
+        if is_env_require_auth(i, &self.env_name, &self.address_names) {
             self.env_require_auth = true;
         }
-        if is_auth_helper_method_call(i, &self.env_name) {
+        if is_auth_helper_method_call(i, &self.env_name, &self.address_names) {
             self.auth_helper_called = true;
         }
         visit::visit_expr_method_call(self, i);
@@ -228,7 +250,7 @@ impl Contract {
     }
 
     #[test]
-    fn still_flags_when_only_address_require_auth() -> Result<(), syn::Error> {
+    fn passes_when_only_address_require_auth() -> Result<(), syn::Error> {
         let hits = run_on_src(
             r#"
 use soroban_sdk::{contractimpl, Address, Env, Symbol};
@@ -244,10 +266,33 @@ impl Contract {
 }
 "#,
         )?;
-        assert_eq!(
-            hits.len(),
-            1,
-            "`user.require_auth()` is not `env.require_auth()` per this check"
+        assert!(
+            hits.is_empty(),
+            "`user.require_auth()` should satisfy the check when user is an Address"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn passes_when_from_address_require_auth() -> Result<(), syn::Error> {
+        let hits = run_on_src(
+            r#"
+use soroban_sdk::{contractimpl, Address, Env, Symbol};
+
+pub struct Contract;
+
+#[contractimpl]
+impl Contract {
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        env.storage().persistent().set(&Symbol::new(&env, "bal"), &amount);
+    }
+}
+"#,
+        )?;
+        assert!(
+            hits.is_empty(),
+            "`from.require_auth()` should satisfy the check when from is an Address"
         );
         Ok(())
     }

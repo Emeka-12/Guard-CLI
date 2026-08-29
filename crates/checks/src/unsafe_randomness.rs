@@ -1,4 +1,5 @@
 use crate::{Check, Finding, Severity};
+use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{ExprMethodCall, File};
 
@@ -21,9 +22,16 @@ impl Check for UnsafeRandomnessCheck {
 #[derive(Default)]
 struct RandomnessVisitor {
     findings: Vec<Finding>,
+    current_function: String,
 }
 
 impl<'ast> Visit<'ast> for RandomnessVisitor {
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        let prev = std::mem::replace(&mut self.current_function, node.sig.ident.to_string());
+        visit::visit_impl_item_fn(self, node);
+        self.current_function = prev;
+    }
+
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method_name = node.method.to_string();
         if method_name == "timestamp" || method_name == "sequence" {
@@ -33,13 +41,16 @@ impl<'ast> Visit<'ast> for RandomnessVisitor {
                     severity: Severity::High,
                     file_path: String::new(),
                     line: node.span().start().line,
-                    function_name: String::new(),
+                    function_name: self.current_function.clone(),
                     description: format!(
                         "env.ledger().{}() should not be used as randomness source",
                         method_name
                     ),
-                    rule_url: None,
-                    fix_hint: Some(
+                    rule_url: Some(
+                        "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unsafe-randomness-high"
+                            .to_string(),
+                    ),
+                    suggestion: Some(
                         "Use oracle services or cryptographic randomness instead".to_string(),
                     ),
                 });

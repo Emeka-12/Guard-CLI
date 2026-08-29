@@ -5,7 +5,7 @@
 //! on it panics and aborts the contract invocation, which can brick a contract
 //! or be exploited by an attacker who triggers the panic intentionally.
 
-use crate::util::contractimpl_functions;
+use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -22,7 +22,7 @@ impl Check for UninitializedStorageReadCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for method in contractimpl_functions(file) {
+        for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
             let mut v = StorageReadVisitor { fn_name, out: &mut out };
             v.visit_block(&method.block);
@@ -41,19 +41,6 @@ fn is_storage_get(expr: &Expr) -> bool {
             }
             is_storage_get(&m.receiver)
         }
-        _ => false,
-    }
-}
-
-fn receiver_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "storage" {
-                return true;
-            }
-            receiver_chain_contains_storage(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_storage(&f.base),
         _ => false,
     }
 }
@@ -78,7 +65,7 @@ impl Visit<'_> for StorageReadVisitor<'_> {
                     "`{}` reads from storage with `.{}()` and immediately calls `.{method}()`. \
                      If the key has never been written the contract will panic on uninitialized storage.",
                     self.fn_name,
-                    if method == "unwrap" { "get" } else { "get" },
+                    "get",
                     method = method,
                 ),
                 rule_url: Some(
