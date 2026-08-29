@@ -1,6 +1,5 @@
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
-use syn::spanned::Spanned;
 use quote::ToTokens;
 use syn::{ExprMethodCall, Block};
 

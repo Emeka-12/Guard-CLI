@@ -8,7 +8,7 @@ use crate::util::{
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Block, Expr, ExprMethodCall, File};
+use syn::{Block, ExprMethodCall, File};
 
 const CHECK_NAME: &str = "missing-event-emission";
 

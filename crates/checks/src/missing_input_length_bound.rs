@@ -1,7 +1,7 @@
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
 use syn::spanned::Spanned;
-use syn::{ImplItem, ItemImpl, FnArg, Pat, PatType};
+use syn::{ImplItem, ItemImpl, FnArg, Pat};
 
 
 const CHECK_NAME: &str = "missing-input-length-bound";
