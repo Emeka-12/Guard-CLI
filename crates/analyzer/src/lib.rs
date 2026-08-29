@@ -171,17 +171,6 @@ fn parse_allow_checks(line: &str) -> Option<Vec<String>> {
     (!checks.is_empty()).then_some(checks)
 }
 
-fn function_name_from_line(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    let fn_pos = trimmed.find("fn ")?;
-    let after_fn = &trimmed[fn_pos + 3..];
-    let name: String = after_fn
-        .chars()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-        .collect();
-    (!name.is_empty()).then_some(name)
-}
-
 /// Index of the first line at or after `from` that carries actual code, skipping the
 /// lines rustfmt and normal documentation routinely insert between a suppression
 /// comment and the item it applies to: blank lines, `//` / `///` / `//!` comments, and
@@ -204,21 +193,19 @@ fn parse_suppressions(source: &str, fn_spans: &[FnSpan]) -> Suppressions {
         let Some(target_idx) = next_substantive_line(&lines, idx + 1) else {
             continue;
         };
-        let target_line = lines[target_idx];
-        if let Some(function_name) = function_name_from_line(target_line) {
-            let target_line_number = target_idx + 1;
-            let impl_type = fn_spans
-                .iter()
-                .find(|s| s.start_line == target_line_number && s.function_name == function_name)
-                .map(|s| s.impl_type.clone())
-                .unwrap_or_default();
+        let target_line_number = target_idx + 1;
+        // Resolve the target from the parsed `#[contractimpl]` spans, keyed on the line
+        // the method starts on - never by scanning the raw text for `"fn "`, which also
+        // matches comments, string literals, and type positions.
+        if let Some(span) = fn_spans.iter().find(|s| s.start_line == target_line_number) {
             for check in checks {
-                suppressions
-                    .function_checks
-                    .insert((impl_type.clone(), function_name.clone(), check));
+                suppressions.function_checks.insert((
+                    span.impl_type.clone(),
+                    span.function_name.clone(),
+                    check,
+                ));
             }
         } else {
-            let target_line_number = target_idx + 1;
             for check in checks {
                 suppressions.line_checks.insert((target_line_number, check));
             }
@@ -866,6 +853,44 @@ impl C {
             .line_checks
             .contains(&(5, "unchecked-arithmetic".to_string())));
         assert!(s.function_checks.is_empty());
+    }
+
+    #[test]
+    fn fn_in_a_string_literal_registers_no_function_suppression() {
+        let src = "\
+#[contractimpl]
+impl C {
+    pub fn go(env: Env) {
+        // soroban-guard: allow(hardcoded-address)
+        let msg = \"call fn later\";
+        let _ = (env, msg);
+    }
+}
+";
+        let s = suppressions_for(src);
+        assert!(s.function_checks.is_empty());
+        assert!(s
+            .line_checks
+            .contains(&(5, "hardcoded-address".to_string())));
+    }
+
+    #[test]
+    fn fn_in_a_type_position_registers_no_function_suppression() {
+        let src = "\
+#[contractimpl]
+impl C {
+    pub fn go(env: Env) {
+        // soroban-guard: allow(unchecked-arithmetic)
+        let handler: fn(u32) -> u32 = double;
+        let _ = (env, handler);
+    }
+}
+";
+        let s = suppressions_for(src);
+        assert!(s.function_checks.is_empty());
+        assert!(s
+            .line_checks
+            .contains(&(5, "unchecked-arithmetic".to_string())));
     }
 }
 
