@@ -12,7 +12,7 @@ use crate::util::contractimpl_functions_excluding_test;
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprMethodCall, File};
+use syn::{Expr, ExprMethodCall, File, FnArg, Pat, Signature, Type};
 
 const CHECK_NAME: &str = "delegate-call-risk";
 
@@ -32,6 +32,7 @@ impl Check for DelegateCallRiskCheck {
             let mut v = DelegateVisitor {
                 has_storage_read: false,
                 last_invoke_contract_line: None,
+                env_ident: env_param_name(&method.sig).unwrap_or_else(|| "env".to_string()),
             };
             v.visit_block(&method.block);
             if v.has_storage_read {
@@ -52,8 +53,6 @@ impl Check for DelegateCallRiskCheck {
                             "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#delegate-call-risk-high"
                                 .to_string(),
                         ),
-                        suggestion: None,
-                        rule_url: None,
                         suggestion: Some(
                             "Pass the callee address as a verified parameter or store it under \
                              an admin-controlled key; call `caller.require_auth()` before using \
@@ -71,6 +70,7 @@ impl Check for DelegateCallRiskCheck {
 struct DelegateVisitor {
     has_storage_read: bool,
     last_invoke_contract_line: Option<usize>,
+    env_ident: String,
 }
 
 impl<'ast> Visit<'ast> for DelegateVisitor {
@@ -78,7 +78,7 @@ impl<'ast> Visit<'ast> for DelegateVisitor {
         if expr_contains_storage_rec(&i.receiver) && i.method == "get" {
             self.has_storage_read = true;
         }
-        if is_invoke_or_try_call(i) && is_env_receiver(&i.receiver) {
+        if is_invoke_or_try_call(i) && is_env_receiver(&i.receiver, &self.env_ident) {
             self.last_invoke_contract_line = Some(i.span().start().line);
         }
         visit::visit_expr_method_call(self, i);
@@ -96,8 +96,33 @@ fn is_invoke_or_try_call(i: &ExprMethodCall) -> bool {
     matches!(i.method.to_string().as_str(), "invoke_contract" | "try_call")
 }
 
-fn is_env_receiver(expr: &Expr) -> bool {
-    matches!(expr, Expr::Path(p) if p.path.is_ident("env"))
+fn is_env_receiver(expr: &Expr, env_ident: &str) -> bool {
+    matches!(expr, Expr::Path(p) if p.path.is_ident(env_ident))
+}
+
+/// Finds the name bound to the `Env`-typed parameter in a method signature (e.g. `env`
+/// in `fn f(env: Env, ..)` or `e` in `fn f(e: Env, ..)`), so the check follows whatever
+/// the contract actually calls its `Env` parameter instead of assuming it's named `env`.
+fn env_param_name(sig: &Signature) -> Option<String> {
+    sig.inputs.iter().find_map(|arg| {
+        let FnArg::Typed(pat_type) = arg else {
+            return None;
+        };
+        let ty = match pat_type.ty.as_ref() {
+            Type::Reference(r) => r.elem.as_ref(),
+            other => other,
+        };
+        let Type::Path(type_path) = ty else {
+            return None;
+        };
+        if type_path.path.segments.last()?.ident != "Env" {
+            return None;
+        }
+        let Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+            return None;
+        };
+        Some(pat_ident.ident.to_string())
+    })
 }
 
 fn expr_contains_storage_rec(expr: &Expr) -> bool {
