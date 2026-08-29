@@ -166,7 +166,7 @@ impl Visit<'_> for ArithVisitor<'_> {
                     self.fn_name
                 ),
                 rule_url: Some(
-                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unchecked-arithmetic"
+                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unchecked-arithmetic-high--medium--low"
                         .to_string(),
                 ),
                 suggestion: None,
