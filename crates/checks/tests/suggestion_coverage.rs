@@ -397,13 +397,11 @@ fn missing_balance_check_has_suggestion() {
         "missing-balance-check",
         r#"
 use soroban_sdk::{contractimpl, Env, Address};
-pub struct C;
 #[contractimpl]
-impl C {
-    pub fn pay(env: Env, sender: Address, recipient: Address, amount: i128) {
-        let _ = (env, sender, amount);
-        let client = recipient.clone();
-        client.transfer(&sender, &amount);
+impl Token {
+    pub fn pay(env: Env, id: Address, sender: Address, recipient: Address, amount: i128) {
+        let token = token::Client::new(&env, &id);
+        token.transfer(&sender, &recipient, &amount);
     }
 }
 "#,
