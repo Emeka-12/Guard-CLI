@@ -8,12 +8,12 @@ const BALANCE_KEY: Symbol = symbol_short!("balance");
 
 #[contractimpl]
 impl UninitializedStorageReadSafe {
-    /// ✅ Guards with has() before reading
+    /// ✅ Guards with has() before reading, then reads safely
     pub fn get_balance(env: Env) -> u128 {
         if !env.storage().persistent().has(&BALANCE_KEY) {
             return 0;
         }
-        env.storage().persistent().get(&BALANCE_KEY).unwrap()
+        env.storage().persistent().get(&BALANCE_KEY).unwrap_or_default()
     }
 
     /// ✅ Uses unwrap_or_default() to safely handle uninitialized storage

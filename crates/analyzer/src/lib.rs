@@ -208,33 +208,6 @@ fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
     Ok(compiled)
 }
 
-/// True when any pattern matches the path, tested both against the root-relative
-/// `label` and the full `path` (a pattern like `vendor/**` should match either form).
-fn glob_matches(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
-    patterns
-        .iter()
-        .any(|p| p.matches_path(label) || p.matches_path(path))
-}
-
-/// Compile glob source strings into patterns, surfacing the first invalid one as
-/// `ScanError::InvalidGlobPattern`. Shared by every scan entry point so exclude and
-/// include filters compile identically.
-fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
-    let mut compiled = Vec::with_capacity(patterns.len());
-    for p in patterns {
-        match glob::Pattern::new(p) {
-            Ok(pattern) => compiled.push(pattern),
-            Err(e) => {
-                return Err(ScanError::InvalidGlobPattern {
-                    pattern: p.clone(),
-                    reason: e.to_string(),
-                })
-            }
-        }
-    }
-    Ok(compiled)
-}
-
 /// Result of applying the shared source-file filter to one candidate path.
 enum PathVerdict {
     /// A `.rs` file that passed every filter and should be scanned.
@@ -304,31 +277,23 @@ fn collect_rust_paths(
             continue;
         }
         let label = path.strip_prefix(root).unwrap_or(path);
-        if glob_matches(&exclude_patterns, label, path) {
-            continue;
-        }
-        if !include_patterns.is_empty() && !glob_matches(&include_patterns, label, path) {
-            continue;
-        }
-        // An unreadable file must not abort the whole scan (a `0600` file in a shared
-        // checkout, a broken symlink, a race with WalkDir's listing). Warn naming the
-        // path and skip it, matching the warn-and-continue precedent for check panics.
-        match has_generated_file_header(path) {
-            Ok(true) => {
-                files_skipped += 1;
-                continue;
-            }
-            Ok(false) => {}
+        match classify_rust_path(path, label, &exclude_patterns, &include_patterns) {
+            Ok(PathVerdict::Scan) => paths.push(path.to_path_buf()),
+            Ok(PathVerdict::GeneratedSkip) => files_skipped += 1,
+            Ok(PathVerdict::Reject) => {}
+            // An unreadable file must not abort the whole scan (a `0600` file in a shared
+            // checkout, a broken symlink, a race with WalkDir's listing). Warn naming the
+            // path and skip it, matching the warn-and-continue precedent for check panics.
             Err(e) => {
-                let err = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    ScanError::PermissionDenied {
-                        path: path.to_path_buf(),
+                let err = match &e {
+                    ScanError::Io(io)
+                        if io.kind() == std::io::ErrorKind::PermissionDenied =>
+                    {
+                        ScanError::PermissionDenied {
+                            path: path.to_path_buf(),
+                        }
                     }
-                } else {
-                    ScanError::IoRead {
-                        path: path.to_path_buf(),
-                        source: e,
-                    }
+                    _ => e,
                 };
                 eprintln!("warning: {err}, skipping file");
                 continue;
@@ -511,17 +476,21 @@ pub fn scan_files(
 ) -> Result<(Vec<Finding>, usize, usize), ScanError> {
     let root = root.canonicalize()?;
     let exclude_patterns = compile_globs(excludes)?;
+    let include_patterns = compile_globs(includes)?;
 
-    let filtered: Vec<&PathBuf> = paths
-        .iter()
-        .filter(|path| {
-            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
-            !glob_matches(&exclude_patterns, label, &path_canon)
-        })
-        .collect();
+    let mut files_skipped = 0;
+    let mut selected: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
+        match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns)? {
+            PathVerdict::Scan => selected.push(path_canon),
+            PathVerdict::GeneratedSkip => files_skipped += 1,
+            PathVerdict::Reject => {}
+        }
+    }
 
-    let files_scanned = filtered.len();
+    let files_scanned = selected.len();
     let checks = default_checks();
 
     let mut findings: Vec<Finding> = selected
