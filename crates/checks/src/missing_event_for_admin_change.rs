@@ -1,3 +1,4 @@
+use crate::util::receiver_chain_contains_events;
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
 use syn::spanned::Spanned;
@@ -115,7 +116,7 @@ struct EventVisitor {
 
 impl<'ast> Visit<'ast> for EventVisitor {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if node.method == "publish" {
+        if node.method == "publish" && receiver_chain_contains_events(&node.receiver) {
             self.found_event = true;
         }
         visit::visit_expr_method_call(self, node);
@@ -134,6 +135,26 @@ mod tests {
 impl C {
     pub fn set_owner(env: Env, new_owner: Address) {
         env.storage().instance().set(&symbol_short!("owner"), &new_owner);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingEventForAdminChangeCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn publish_on_non_events_receiver_does_not_suppress() -> Result<(), syn::Error> {
+        // #513: `channel.publish(...)` is unrelated to `env.events()` and must not
+        // count as admin-change event emission.
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn set_owner(env: Env, new_owner: Address) {
+        env.storage().instance().set(&symbol_short!("owner"), &new_owner);
+        channel.publish(&new_owner);
     }
 }
         "#;

@@ -1,5 +1,6 @@
 //! Shared helpers for walking `#[contractimpl]` impl blocks.
 
+use std::collections::HashSet;
 use syn::{Expr, FnArg, ImplItem, Item, ItemImpl, Pat, Signature, Type};
 
 pub fn is_contractimpl(item_impl: &ItemImpl) -> bool {
@@ -230,6 +231,32 @@ pub(crate) fn receiver_chain_contains_storage(expr: &Expr) -> bool {
 /// Does the receiver chain of `expr` contain a call to `.events()`?
 pub(crate) fn receiver_chain_contains_events(expr: &Expr) -> bool {
     receiver_chain_contains(expr, "events")
+}
+
+/// Is `receiver` something `.require_auth()` / `.require_auth_for_args()` can be legally
+/// called on? Recognizes the `Env` parameter, `Address` parameters, function-local bindings
+/// of type `Address`, field accesses (`self.admin`, `self.owner`), and method-chain receivers
+/// (`admin.clone()`, `get_admin(&env)`) — all of which yield an `Address`/auth-invoker in
+/// practice. A bare path that is none of the above (a random local) is *not* treated as an
+/// auth gate, so unrelated `.require_auth()` calls don't silence the check.
+pub(crate) fn receiver_is_auth_gate(
+    receiver: &Expr,
+    env_name: &str,
+    address_names: &[String],
+    address_locals: &HashSet<String>,
+) -> bool {
+    match receiver {
+        Expr::Path(p) => {
+            p.path.is_ident(env_name)
+                || address_names.iter().any(|a| p.path.is_ident(a))
+                || p.path
+                    .get_ident()
+                    .map(|i| address_locals.contains(&i.to_string()))
+                    .unwrap_or(false)
+        }
+        Expr::Field(_) | Expr::MethodCall(_) => true,
+        _ => false,
+    }
 }
 
 /// Does the receiver chain of `expr` contain a call to `.temporary()`?
