@@ -189,17 +189,25 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
     });
 }
 
-/// True when any pattern matches the path, tested both against the root-relative
-/// `label` and the full `path` (a pattern like `vendor/**` should match either form).
-fn glob_matches(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
-    patterns
+/// Drop the medium-severity `integer-division-truncation` finding when the same
+/// file/line/function already has a high-severity `unchecked-divisor` finding.
+/// Both checks fire on the exact same non-literal `a / b` expression, so reporting
+/// both is redundant signal for one underlying division.
+fn suppress_redundant_division_finding(findings: &mut Vec<Finding>) {
+    let divisor_hits: HashSet<(String, usize, String)> = findings
         .iter()
-        .any(|p| p.matches_path(label) || p.matches_path(path))
+        .filter(|f| f.check_name == "unchecked-divisor")
+        .map(|f| (f.file_path.clone(), f.line, f.function_name.clone()))
+        .collect();
+    findings.retain(|f| {
+        f.check_name != "integer-division-truncation"
+            || !divisor_hits.contains(&(f.file_path.clone(), f.line, f.function_name.clone()))
+    });
 }
 
-/// Compile glob source strings into patterns, surfacing the first invalid one as
-/// `ScanError::InvalidGlobPattern`. Shared by every scan entry point so exclude and
-/// include filters compile identically.
+/// Compile a list of glob source strings into `glob::Pattern`s, surfacing the first
+/// invalid pattern as `ScanError::InvalidGlobPattern`. Shared by the exclude and
+/// include filters so `--include`/`--exclude` stay behaviourally identical.
 fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
     let mut compiled = Vec::with_capacity(patterns.len());
     for p in patterns {
@@ -285,31 +293,23 @@ fn collect_rust_paths(
             continue;
         }
         let label = path.strip_prefix(root).unwrap_or(path);
-        if glob_matches(&exclude_patterns, label, path) {
-            continue;
-        }
-        if !include_patterns.is_empty() && !glob_matches(&include_patterns, label, path) {
-            continue;
-        }
-        // An unreadable file must not abort the whole scan (a `0600` file in a shared
-        // checkout, a broken symlink, a race with WalkDir's listing). Warn naming the
-        // path and skip it, matching the warn-and-continue precedent for check panics.
-        match has_generated_file_header(path) {
-            Ok(true) => {
-                files_skipped += 1;
-                continue;
-            }
-            Ok(false) => {}
+        match classify_rust_path(path, label, &exclude_patterns, &include_patterns) {
+            Ok(PathVerdict::Scan) => paths.push(path.to_path_buf()),
+            Ok(PathVerdict::GeneratedSkip) => files_skipped += 1,
+            Ok(PathVerdict::Reject) => {}
+            // An unreadable file must not abort the whole scan (a `0600` file in a shared
+            // checkout, a broken symlink, a race with WalkDir's listing). Warn naming the
+            // path and skip it, matching the warn-and-continue precedent for check panics.
             Err(e) => {
-                let err = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    ScanError::PermissionDenied {
-                        path: path.to_path_buf(),
+                let err = match &e {
+                    ScanError::Io(io)
+                        if io.kind() == std::io::ErrorKind::PermissionDenied =>
+                    {
+                        ScanError::PermissionDenied {
+                            path: path.to_path_buf(),
+                        }
                     }
-                } else {
-                    ScanError::IoRead {
-                        path: path.to_path_buf(),
-                        source: e,
-                    }
+                    _ => e,
                 };
                 eprintln!("warning: {err}, skipping file");
                 continue;
@@ -382,6 +382,7 @@ fn run_checks_for_file(
         .collect();
 
     findings.sort_by_key(|f| f.line);
+    suppress_redundant_division_finding(&mut findings);
     dedup_findings(&mut findings);
     Ok(findings)
 }
@@ -494,28 +495,19 @@ pub fn scan_files(
     let exclude_patterns = compile_globs(excludes)?;
     let include_patterns = compile_globs(includes)?;
 
-    let mut files_skipped = 0usize;
-    let filtered: Vec<PathBuf> = paths
-        .iter()
-        .filter_map(|path| {
-            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
-            match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns) {
-                Ok(PathVerdict::Scan) => Some(path_canon),
-                Ok(PathVerdict::GeneratedSkip) => {
-                    files_skipped += 1;
-                    None
-                }
-                Ok(PathVerdict::Reject) => None,
-                Err(e) => {
-                    eprintln!("warning: {e}, skipping file");
-                    None
-                }
-            }
-        })
-        .collect();
+    let mut files_skipped = 0;
+    let mut selected: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
+        match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns)? {
+            PathVerdict::Scan => selected.push(path_canon),
+            PathVerdict::GeneratedSkip => files_skipped += 1,
+            PathVerdict::Reject => {}
+        }
+    }
 
-    let files_scanned = filtered.len();
+    let files_scanned = selected.len();
     let checks = default_checks();
 
     let mut findings: Vec<Finding> = filtered

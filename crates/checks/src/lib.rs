@@ -259,6 +259,22 @@ pub fn default_checks() -> Vec<Box<dyn Check + Send + Sync>> {
     checks
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{default_checks, default_checks_with_config};
+
+    #[test]
+    fn default_and_configured_check_lists_share_same_names() {
+        let default_names: Vec<_> = default_checks().iter().map(|check| check.name().to_string()).collect();
+        let configured_names: Vec<_> = default_checks_with_config(&[], &[])
+            .iter()
+            .map(|check| check.name().to_string())
+            .collect();
+
+        assert_eq!(default_names, configured_names);
+    }
+}
+
 /// Like [`default_checks`] but applies config-file settings:
 /// - `disabled`: check names to omit
 /// - `extra_sensitive_names`: extra names added to `UnprotectedAdminCheck`

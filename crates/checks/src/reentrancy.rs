@@ -9,8 +9,8 @@ use syn::{Expr, ExprMethodCall, File};
 const CHECK_NAME: &str = "reentrancy-risk";
 
 /// Flags `#[contractimpl]` methods that call `invoke_contract` or
-/// `invoke_contract_check` after a storage write (`set`, `remove`, `extend_ttl`,
-/// `bump`, `append`) without reading state again first.
+/// `invoke_contract_check` after a storage write (`set`, `remove`, `append`)
+/// without reading state again first.
 pub struct ReentrancyRiskCheck;
 
 impl Check for ReentrancyRiskCheck {
@@ -56,10 +56,9 @@ impl Check for ReentrancyRiskCheck {
 
 fn is_storage_write(m: &ExprMethodCall) -> bool {
     let name = m.method.to_string();
-    if !matches!(
-        name.as_str(),
-        "set" | "remove" | "extend_ttl" | "bump" | "append"
-    ) {
+    // `extend_ttl`/`bump` only change a storage entry's expiration, not its stored
+    // value, so they cannot open a checks-effects-interactions hazard on their own.
+    if !matches!(name.as_str(), "set" | "remove" | "append") {
         return false;
     }
     receiver_has_storage(&m.receiver)
@@ -174,6 +173,42 @@ impl C {
         env.storage().persistent().set(&to, &42i128);
         let _v: i128 = env.storage().persistent().get(&to).unwrap();
         env.invoke_contract::<()>(&to, &soroban_sdk::symbol_short!("cb"), soroban_sdk::vec![&env]);
+    }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn passes_ttl_bump_before_invoke() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+
+pub struct C;
+
+#[contractimpl]
+impl C {
+    pub fn ping(env: Env, peer: Address) {
+        env.storage().persistent().extend_ttl(&peer, 100, 1000);
+        env.invoke_contract::<()>(&peer, &soroban_sdk::symbol_short!("cb"), soroban_sdk::vec![&env]);
+    }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn passes_bump_before_invoke() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+
+pub struct C;
+
+#[contractimpl]
+impl C {
+    pub fn ping(env: Env, peer: Address) {
+        env.storage().persistent().bump(&peer, 100, 1000);
+        env.invoke_contract::<()>(&peer, &soroban_sdk::symbol_short!("cb"), soroban_sdk::vec![&env]);
     }
 }
 "#);

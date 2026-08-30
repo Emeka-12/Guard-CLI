@@ -31,7 +31,9 @@ struct TokenAmountVisitor {
 impl<'ast> Visit<'ast> for TokenAmountVisitor {
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         let prev = std::mem::replace(&mut self.current_function, node.sig.ident.to_string());
+        let prev_block = std::mem::replace(&mut self.current_block, Some(Box::new(node.block.clone())));
         visit::visit_impl_item_fn(self, node);
+        self.current_block = prev_block;
         self.current_function = prev;
     }
 
@@ -128,7 +130,7 @@ impl C {
         let file = parse_file(src)?;
         let check = UncheckedTokenAmountCheck;
         let findings = check.run(&file, src);
-        assert!(findings.len() > 0 || findings.is_empty());
+        assert!(findings.len() > 0);
         Ok(())
     }
 }
