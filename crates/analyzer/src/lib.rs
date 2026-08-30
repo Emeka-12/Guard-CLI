@@ -510,7 +510,7 @@ pub fn scan_files(
     let files_scanned = selected.len();
     let checks = default_checks();
 
-    let mut findings: Vec<Finding> = selected
+    let mut findings: Vec<Finding> = filtered
         .par_iter()
         .map(|path| run_checks_for_file(path, &root, &checks))
         .collect::<Result<Vec<Vec<Finding>>, ScanError>>()?
