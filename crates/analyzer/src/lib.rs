@@ -59,6 +59,10 @@ pub enum ScanError {
     },
     #[error("Invalid glob pattern `{pattern}`: {reason}")]
     InvalidGlobPattern { pattern: String, reason: String },
+    /// A WalkDir traversal error (e.g. permission-denied on a subdirectory).
+    /// The scan is incomplete and must not be treated as clean.
+    #[error("Directory traversal error at {path}: {reason}")]
+    Traversal { path: PathBuf, reason: String },
 }
 
 #[derive(Default)]
@@ -281,11 +285,30 @@ fn collect_rust_paths(
 
     let mut files_skipped = 0;
     let mut paths = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                // Surface traversal errors (permission-denied on a directory,
+                // vanished path, symlink loop, etc.) as a hard failure.  A
+                // deploy-gating tool must not present an incomplete scan as clean.
+                let path = e
+                    .path()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| root.to_path_buf());
+                return Err(ScanError::Traversal {
+                    path,
+                    reason: e.to_string(),
+                });
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
         let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
         if path
             .components()
             .any(|c| matches!(c.as_os_str().to_str(), Some("target" | ".git")))
@@ -315,6 +338,7 @@ fn collect_rust_paths(
                 continue;
             }
         }
+        paths.push(path.to_path_buf());
     }
 
     Ok((paths, files_skipped))
@@ -495,12 +519,15 @@ pub fn scan_files(
     let exclude_patterns = compile_globs(excludes)?;
     let include_patterns = compile_globs(includes)?;
 
+    let mut filtered: Vec<&PathBuf> = Vec::new();
+    let mut files_skipped = 0usize;
     let mut files_skipped = 0;
     let mut selected: Vec<PathBuf> = Vec::new();
     for path in paths {
         let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
         match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns)? {
+            PathVerdict::Scan => filtered.push(path),
             PathVerdict::Scan => selected.push(path_canon),
             PathVerdict::GeneratedSkip => files_skipped += 1,
             PathVerdict::Reject => {}
@@ -767,6 +794,79 @@ mod tests {
             "expected findings from the readable file"
         );
         assert_eq!(names(&file_findings), names(&dir_findings));
+    }
+
+    /// An unreadable **subdirectory** must cause the scan to fail with
+    /// `ScanError::Traversal` — not silently succeed with a clean result.
+    ///
+    /// This is the fix for #484: `filter_map(Result::ok)` used to drop the WalkDir
+    /// traversal error, leaving the subtree silently unscanned while the exit code
+    /// remained 0.
+    ///
+    /// Unix-only (relies on POSIX mode bits); skipped when running as root.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subdirectory_is_not_silently_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-unreadable-dir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("src/private")).unwrap();
+
+        // A readable file at the top level.
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+        // A file inside the unreadable subdirectory.
+        fs::write(root.join("src/private/secret.rs"), "pub fn secret() {}").unwrap();
+
+        // Remove read+execute permission from the subdirectory so WalkDir cannot
+        // list its contents.
+        fs::set_permissions(
+            root.join("src/private"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        // If the process can still read the dir (running as root), the scenario
+        // under test does not apply; skip gracefully.
+        if root.join("src/private").read_dir().is_ok() {
+            let _ = fs::set_permissions(
+                root.join("src/private"),
+                fs::Permissions::from_mode(0o755),
+            );
+            fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+
+        let result = scan_directory(&root, &[], &[]);
+
+        // Restore permissions before any assertion so the temp dir can be cleaned up.
+        let _ = fs::set_permissions(
+            root.join("src/private"),
+            fs::Permissions::from_mode(0o755),
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            result.is_err(),
+            "scan_directory must return Err when a subdirectory is unreadable, \
+             not silently succeed — got Ok"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ScanError::Traversal { .. }),
+            "expected ScanError::Traversal, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("traversal") || err.to_string().contains("private"),
+            "error message should mention the path or 'traversal', got: {err}"
+        );
     }
 
     #[test]
