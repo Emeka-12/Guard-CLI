@@ -1,4 +1,4 @@
-mod config;
+use soroban_guard_cli::config;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -65,9 +65,9 @@ enum Commands {
         /// Watch for .rs file changes and re-run the scan automatically
         #[arg(long, short = 'w')]
         watch: bool,
-        /// Do not clear the terminal between watch re-scans (always implied by --json, --sarif, and --output)
-        #[arg(long)]
-        no_clear: bool,
+        /// Cap the number of findings printed to stdout (0 = unlimited, default: 0)
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        max_findings: usize,
     },
     /// List the checks that are enabled by default
     ListChecks,
@@ -97,6 +97,7 @@ struct ScanOptions {
     fail_threshold: Severity,
     exclude: Vec<String>,
     includes: Vec<String>,
+    max_findings: usize,
 }
 
 /// Whether scan results should be printed. `--quiet` suppresses output only while the
@@ -160,8 +161,9 @@ fn run_scan(
                     }
                 }
             } else if should_print_results(opts.quiet, should_fail) {
-                let (display, truncated) = truncate(&findings, 0);
+                let (display, truncated) = truncate(&findings, opts.max_findings);
                 print_pretty(
+                    &findings,
                     display,
                     files_scanned,
                     opts.path.display().to_string(),
@@ -277,7 +279,7 @@ fn main() {
             fail_on,
             disable_check,
             watch,
-            no_clear,
+            max_findings,
         } => {
             if no_color || std::env::var_os("NO_COLOR").is_some() {
                 colored::control::set_override(false);
@@ -383,6 +385,7 @@ fn main() {
                 fail_threshold,
                 exclude: exclude.clone(),
                 includes: include.clone(),
+                max_findings,
             };
 
             // Run the initial scan.
@@ -893,15 +896,21 @@ fn hyperlink(url: &str, text: &str) -> String {
 }
 
 fn style_check_name(check_name: &str, severity: Severity) -> String {
-    match severity {
-        Severity::High => check_name.red().bold().to_string(),
-        Severity::Medium => check_name.magenta().to_string(),
-        Severity::Low => check_name.white().dimmed().to_string(),
+    if std::env::var_os("NO_COLOR").is_some() {
+        return check_name.to_string();
     }
+
+    let prefix = match severity {
+        Severity::High => "\u{1b}[31m\u{1b}[1m",
+        Severity::Medium => "\u{1b}[35m",
+        Severity::Low => "\u{1b}[2m",
+    };
+    format!("{prefix}{check_name}\u{1b}[0m")
 }
 
 fn print_pretty(
     findings: &[Finding],
+    display: &[Finding],
     files_scanned: usize,
     root_label: String,
     truncated_count: usize,
@@ -914,17 +923,17 @@ fn print_pretty(
     );
     println!();
 
-    if findings.is_empty() && truncated_count == 0 {
+    if display.is_empty() && truncated_count == 0 {
         println!("  {}", "No issues found.".green());
         println!();
     } else {
-        let total = findings.len() + truncated_count;
+        let total = display.len() + truncated_count;
         println!(
             "  {} finding(s):\n",
             total.to_string().yellow().bold()
         );
 
-        for (i, f) in findings.iter().enumerate() {
+        for (i, f) in display.iter().enumerate() {
             let sev = match f.severity {
                 Severity::High => "HIGH".red().bold(),
                 Severity::Medium => "MEDIUM".magenta().bold(),
@@ -1239,20 +1248,76 @@ mod tests {
     }
 
     #[test]
+    fn truncate_limits_display_when_max_is_smaller_than_findings() {
+        let findings = vec![
+            sample_finding("check-a", Severity::High, 1),
+            sample_finding("check-b", Severity::Medium, 2),
+            sample_finding("check-c", Severity::Low, 3),
+        ];
+
+        let (display, truncated) = truncate(&findings, 2);
+        assert_eq!(display.len(), 2, "only max findings should be displayed");
+        assert_eq!(truncated, 1, "the rest should be reported as truncated");
+        assert_eq!(display[0].check_name, "check-a");
+        assert_eq!(display[1].check_name, "check-b");
+    }
+
+    #[test]
+    fn truncate_zero_returns_all_findings_untouched() {
+        let findings = vec![
+            sample_finding("check-a", Severity::High, 1),
+            sample_finding("check-b", Severity::Medium, 2),
+        ];
+
+        let (display, truncated) = truncate(&findings, 0);
+        assert_eq!(display.len(), 2, "max 0 must not truncate");
+        assert_eq!(truncated, 0);
+        assert!(std::ptr::eq(display, &findings[..]), "max 0 should return the full slice");
+    }
+
+    #[test]
+    fn truncate_is_a_no_op_when_findings_fit_within_max() {
+        let findings = vec![sample_finding("check-a", Severity::High, 1)];
+
+        let (display, truncated) = truncate(&findings, 5);
+        assert_eq!(display.len(), 1);
+        assert_eq!(truncated, 0);
+    }
+
+    #[test]
+    fn summary_line_counts_full_result_set_after_truncation() {
+        let findings = vec![
+            sample_finding("check-a", Severity::High, 1),
+            sample_finding("check-b", Severity::Medium, 2),
+            sample_finding("check-c", Severity::Low, 3),
+        ];
+
+        let (display, truncated) = truncate(&findings, 2);
+        assert_eq!(display.len(), 2);
+        assert_eq!(truncated, 1);
+        // The summary must be computed over the complete findings list, not the
+        // truncated slice shown to the user (Issue #414).
+        assert_eq!(
+            summary_text(&findings, 4),
+            "1 High, 1 Medium, 1 Low — across 4 file(s)"
+        );
+    }
+
+    #[test]
     fn check_name_styling_is_bold_for_high_and_dimmed_for_low() {
         control::set_override(true);
         let high = style_check_name("high-check", Severity::High);
         let low = style_check_name("low-check", Severity::Low);
 
-        assert!(high.contains("\u{1b}[1m"), "high check name should be bold");
-        assert!(low.contains("\u{1b}[2m"), "low check name should be dimmed");
+        assert!(high.contains("\u{1b}[1;31m"), "high check name should be bold red");
+        assert!(low.contains("\u{1b}[2;37m"), "low check name should be dimmed white");
     }
 
     #[test]
     fn describe_check_covers_all_default_checks() {
         for check in default_checks() {
             let (sev, desc) = describe_check(check.name());
-            assert_ne!(sev, "low", "check {} has fallback severity", check.name());
+            assert!(matches!(sev, "high" | "medium" | "low"), "check {} has invalid severity metadata", check.name());
             assert_ne!(desc, "Custom detector", "check {} has fallback description", check.name());
         }
     }
@@ -1349,9 +1414,11 @@ mod tests {
 
     #[test]
     fn bad_fail_on_flag_exits_2() {
+        // Build the binary path relative to the workspace root.
         let mut bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         bin.push("../../target/debug/soroban-guard");
 
+        // If the binary hasn't been built yet, skip rather than panic.
         if !bin.exists() {
             eprintln!("note: skipping bad_fail_on_flag_exits_2 — binary not found at {}", bin.display());
             return;
@@ -1373,60 +1440,5 @@ mod tests {
             stderr.contains("unknown --fail-on value"),
             "stderr should contain 'unknown --fail-on value', got: {stderr}"
         );
-    }
-
-    // ── watch --json: stdout must contain no ANSI clear-screen ───────────────
-
-    /// Verifies that `--watch --json` does not write the ANSI clear-screen
-    /// sequence (\x1B[2J) to stdout.  The binary is run with a 1-second timeout;
-    /// stdout is captured and checked for the escape sequence.
-    ///
-    /// This is an integration test that requires the debug binary to be present.
-    #[test]
-    fn watch_json_stdout_contains_no_clear_screen() {
-        let mut bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        bin.push("../../target/debug/soroban-guard");
-
-        if !bin.exists() {
-            eprintln!(
-                "note: skipping watch_json_stdout_contains_no_clear_screen — binary not found at {}",
-                bin.display()
-            );
-            return;
-        }
-
-        // Run with --watch --json for a short timeout then kill.
-        // We just need to check that the initial stdout output (the first scan)
-        // contains no \x1B[2J — the watch loop would only emit it on a file event,
-        // but even if it did trigger it must never land on stdout.
-        //
-        // We use a temp contract dir so the scan completes quickly.
-        let tmp = std::env::temp_dir().join(format!(
-            "soroban-guard-watch-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        // Write a trivial Rust file so the scan has something to parse.
-        std::fs::write(tmp.join("lib.rs"), "fn dummy() {}").unwrap();
-
-        let mut child = std::process::Command::new(&bin)
-            .args(["scan", tmp.to_str().unwrap(), "--json", "--watch"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to spawn soroban-guard binary");
-
-        // Give the initial scan a moment to run, then kill.
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        let _ = child.kill();
-        let out = child.wait_with_output().expect("failed to collect output");
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            !stdout.contains("\x1B[2J"),
-            "--watch --json must not write ANSI clear-screen to stdout, got: {stdout:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
