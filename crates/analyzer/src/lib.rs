@@ -520,14 +520,15 @@ pub fn scan_files(
 
     let mut filtered: Vec<&PathBuf> = Vec::new();
     let mut files_skipped = 0usize;
-    let mut files_skipped = 0;
     let mut selected: Vec<PathBuf> = Vec::new();
     for path in paths {
         let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
         match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns)? {
-            PathVerdict::Scan => filtered.push(path),
-            PathVerdict::Scan => selected.push(path_canon),
+            PathVerdict::Scan => {
+                filtered.push(path);
+                selected.push(path_canon);
+            }
             PathVerdict::GeneratedSkip => files_skipped += 1,
             PathVerdict::Reject => {}
         }
