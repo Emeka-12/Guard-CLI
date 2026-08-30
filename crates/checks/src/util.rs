@@ -1,6 +1,6 @@
 //! Shared helpers for walking `#[contractimpl]` impl blocks.
 
-use syn::{Expr, ImplItem, Item, ItemImpl};
+use syn::{Expr, FnArg, ImplItem, Item, ItemImpl, Pat, Signature, Type};
 
 pub fn is_contractimpl(item_impl: &ItemImpl) -> bool {
     item_impl
@@ -147,6 +147,52 @@ pub(crate) fn receiver_chain_contains_temporary(expr: &Expr) -> bool {
 /// Does the receiver chain of `expr` contain a call to `.persistent()`?
 pub(crate) fn receiver_chain_contains_persistent(expr: &Expr) -> bool {
     receiver_chain_contains(expr, "persistent")
+}
+
+/// Returns the name of the first parameter whose type is `Env` (or `soroban_sdk::Env`).
+pub fn env_param_name(sig: &Signature) -> Option<String> {
+    for arg in &sig.inputs {
+        let FnArg::Typed(pat_type) = arg else {
+            continue;
+        };
+        if !type_is_env(&pat_type.ty) {
+            continue;
+        }
+        if let Pat::Ident(ident) = &*pat_type.pat {
+            return Some(ident.ident.to_string());
+        }
+    }
+    None
+}
+
+pub fn type_is_env(ty: &Type) -> bool {
+    let Type::Path(tp) = ty else {
+        return false;
+    };
+    tp.path.segments.last().is_some_and(|s| s.ident == "Env")
+}
+
+pub fn type_is_address(ty: &Type) -> bool {
+    let Type::Path(tp) = ty else {
+        return false;
+    };
+    tp.path.segments.last().is_some_and(|s| s.ident == "Address")
+}
+
+/// Names of every `Address`-typed parameter.
+pub fn address_param_names(sig: &Signature) -> Vec<String> {
+    let mut names = Vec::new();
+    for arg in &sig.inputs {
+        let FnArg::Typed(pat_type) = arg else {
+            continue;
+        };
+        if type_is_address(&pat_type.ty) {
+            if let Pat::Ident(ident) = &*pat_type.pat {
+                names.push(ident.ident.to_string());
+            }
+        }
+    }
+    names
 }
 
 fn collect_contractimpl_fns<'a>(
