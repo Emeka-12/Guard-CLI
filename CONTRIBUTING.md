@@ -135,7 +135,7 @@ Use [`crates/checks/src/auth.rs`](crates/checks/src/auth.rs) as the canonical la
 2. **Register the module** — In [`crates/checks/src/lib.rs`](crates/checks/src/lib.rs):
    - `pub mod my_rule;`
    - `pub use my_rule::MyRuleCheck;`
-   - Push `Box::new(MyRuleCheck)` into `default_checks()`. Order only affects listing, not semantics.
+   - Push `Box::new(MyRuleCheck)` into `all_checks_base()`. `default_checks()` and the config-aware variant both derive from that list, so one registration keeps the runtime and listing behavior in sync. Order only affects listing, not semantics.
 
 3. **Keep checks isolated** — Do **not** use shared mutable static state. Pass data through function arguments or use `util.rs` for **pure** helpers. Each `Check::run` must behave the same regardless of which other checks ran first.
 

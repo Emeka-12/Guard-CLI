@@ -74,6 +74,9 @@ struct GuardScan {
     guard_ctx: bool,
 }
 
+const FROM_KEYS: &[&str] = &["from", "sender", "source", "spender"];
+const TO_KEYS: &[&str] = &["to", "recipient", "dest", "destination"];
+
 fn collect_idents(expr: &Expr) -> Vec<String> {
     let mut out = Vec::new();
     collect_idents_rec(expr, &mut out);
@@ -91,12 +94,43 @@ fn collect_idents_rec(expr: &Expr, acc: &mut Vec<String>) {
             collect_idents_rec(&m.receiver, acc);
             acc.push(m.method.to_string());
         }
-        Expr::Field(f) => collect_idents_rec(&f.base, acc),
+        // Field access (`tx.from`, `self.to`, ...): the field name itself is what carries
+        // sender/recipient meaning, so collect it as well as walking into the base.
+        Expr::Field(f) => {
+            if let syn::Member::Named(name) = &f.member {
+                acc.push(name.to_string());
+            }
+            collect_idents_rec(&f.base, acc);
+        }
         Expr::Call(c) => collect_idents_rec(&c.func, acc),
         Expr::Paren(p) => collect_idents_rec(&p.expr, acc),
         Expr::Unary(u) => collect_idents_rec(&u.expr, acc),
+        Expr::Reference(r) => collect_idents_rec(&r.expr, acc),
         _ => {}
     }
+}
+
+/// True if any collected identifier matches one of `keys`, either exactly or as an
+/// underscore-delimited word (so `from_addr`/`tx.from`/`to_addr` match `from`/`to` while
+/// unrelated identifiers like `token` do not).
+fn idents_match_any(idents: &[String], keys: &[&str]) -> bool {
+    idents.iter().any(|id| {
+        let lower = id.to_lowercase();
+        lower.split('_').any(|word| keys.contains(&word))
+    })
+}
+
+/// Does the pair of expressions read like a sender/recipient comparison (in either order)?
+fn is_sender_recipient_pair(left: &Expr, right: &Expr) -> bool {
+    let left_idents = collect_idents(left);
+    let right_idents = collect_idents(right);
+
+    let left_is_from = idents_match_any(&left_idents, FROM_KEYS);
+    let left_is_to = idents_match_any(&left_idents, TO_KEYS);
+    let right_is_from = idents_match_any(&right_idents, FROM_KEYS);
+    let right_is_to = idents_match_any(&right_idents, TO_KEYS);
+
+    (left_is_from && right_is_to) || (left_is_to && right_is_from)
 }
 
 impl<'ast> Visit<'ast> for GuardScan {
@@ -141,24 +175,29 @@ impl<'ast> Visit<'ast> for GuardScan {
         if self.found || !self.guard_ctx {
             return;
         }
-        if matches!(i.op, BinOp::Ne(_) | BinOp::Eq(_)) {
-            let left_idents = collect_idents(&i.left);
-            let right_idents = collect_idents(&i.right);
-
-            let from_keys = ["from", "sender", "source", "spender"];
-            let to_keys = ["to", "recipient", "dest", "destination"];
-
-            let left_is_from = left_idents.iter().any(|id| from_keys.contains(&id.as_str()));
-            let left_is_to = left_idents.iter().any(|id| to_keys.contains(&id.as_str()));
-            let right_is_from = right_idents.iter().any(|id| from_keys.contains(&id.as_str()));
-            let right_is_to = right_idents.iter().any(|id| to_keys.contains(&id.as_str()));
-
-            if (left_is_from && right_is_to) || (left_is_to && right_is_from) {
-                self.found = true;
-                return;
-            }
+        if matches!(i.op, BinOp::Ne(_) | BinOp::Eq(_))
+            && is_sender_recipient_pair(&i.left, &i.right)
+        {
+            self.found = true;
+            return;
         }
         visit::visit_expr_binary(self, i);
+    }
+
+    fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
+        if self.found || !self.guard_ctx {
+            return;
+        }
+        let method = i.method.to_string();
+        if matches!(method.as_str(), "ne" | "eq") {
+            if let Some(arg) = i.args.first() {
+                if i.args.len() == 1 && is_sender_recipient_pair(&i.receiver, arg) {
+                    self.found = true;
+                    return;
+                }
+            }
+        }
+        visit::visit_expr_method_call(self, i);
     }
 }
 
@@ -311,6 +350,83 @@ impl C {
         let hits = SelfTransferCheck.run(&file, "");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].function_name, "transfer_from");
+        Ok(())
+    }
+
+    #[test]
+    fn passes_transfer_with_from_addr_ne_to_addr() -> Result<(), syn::Error> {
+        let file = parse_file(
+            r#"
+use soroban_sdk::{contractimpl, Address, Env};
+
+pub struct C;
+
+#[contractimpl]
+impl C {
+    pub fn transfer(env: Env, from_addr: Address, to_addr: Address, amount: i128) {
+        if from_addr != to_addr {
+            from_addr.require_auth();
+            let _ = (env, amount);
+        }
+    }
+}
+"#,
+        )?;
+        let hits = SelfTransferCheck.run(&file, "");
+        assert!(hits.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn passes_transfer_with_from_ne_method_call() -> Result<(), syn::Error> {
+        let file = parse_file(
+            r#"
+use soroban_sdk::{contractimpl, Address, Env};
+
+pub struct C;
+
+#[contractimpl]
+impl C {
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        if from.ne(&to) {
+            from.require_auth();
+            let _ = (env, amount);
+        }
+    }
+}
+"#,
+        )?;
+        let hits = SelfTransferCheck.run(&file, "");
+        assert!(hits.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn passes_transfer_with_field_access_guard() -> Result<(), syn::Error> {
+        let file = parse_file(
+            r#"
+use soroban_sdk::{contractimpl, Address, Env};
+
+pub struct Tx {
+    from: Address,
+    to: Address,
+}
+
+pub struct C;
+
+#[contractimpl]
+impl C {
+    pub fn transfer(env: Env, tx: Tx, amount: i128) {
+        if tx.from != tx.to {
+            tx.from.require_auth();
+            let _ = (env, amount);
+        }
+    }
+}
+"#,
+        )?;
+        let hits = SelfTransferCheck.run(&file, "");
+        assert!(hits.is_empty());
         Ok(())
     }
 
