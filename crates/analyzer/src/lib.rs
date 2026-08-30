@@ -189,6 +189,22 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
     });
 }
 
+/// Drop the medium-severity `integer-division-truncation` finding when the same
+/// file/line/function already has a high-severity `unchecked-divisor` finding.
+/// Both checks fire on the exact same non-literal `a / b` expression, so reporting
+/// both is redundant signal for one underlying division.
+fn suppress_redundant_division_finding(findings: &mut Vec<Finding>) {
+    let divisor_hits: HashSet<(String, usize, String)> = findings
+        .iter()
+        .filter(|f| f.check_name == "unchecked-divisor")
+        .map(|f| (f.file_path.clone(), f.line, f.function_name.clone()))
+        .collect();
+    findings.retain(|f| {
+        f.check_name != "integer-division-truncation"
+            || !divisor_hits.contains(&(f.file_path.clone(), f.line, f.function_name.clone()))
+    });
+}
+
 /// Compile a list of glob source strings into `glob::Pattern`s, surfacing the first
 /// invalid pattern as `ScanError::InvalidGlobPattern`. Shared by the exclude and
 /// include filters so `--include`/`--exclude` stay behaviourally identical.
@@ -366,6 +382,7 @@ fn run_checks_for_file(
         .collect();
 
     findings.sort_by_key(|f| f.line);
+    suppress_redundant_division_finding(&mut findings);
     dedup_findings(&mut findings);
     Ok(findings)
 }
