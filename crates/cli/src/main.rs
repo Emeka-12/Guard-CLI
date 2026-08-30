@@ -8,7 +8,7 @@ use soroban_guard_analyzer::scan_directory_with_checks;
 use soroban_guard_checks::{default_checks, default_checks_with_config, Finding, Severity};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -471,11 +471,20 @@ fn main() {
                                 }
                             }
 
-                            // Clear terminal for a clean view.
-                            print!("\x1B[2J\x1B[1;1H");
-                            // Flush so the clear sequence happens in order relative to the
-                            // stderr header on the next line.
-                            let _ = io::stdout().flush();
+                            // Clear terminal for a clean view — only when output is
+                            // going to a human-readable TTY and is not a structured
+                            // format (--json / --sarif / --output).  Send to stderr so
+                            // stdout stays clean for machine consumers.
+                            let stdout_is_tty = std::io::stdout().is_terminal();
+                            let should_clear = !no_clear
+                                && !json
+                                && !sarif
+                                && output.is_none()
+                                && stdout_is_tty;
+                            if should_clear {
+                                eprint!("\x1B[2J\x1B[1;1H");
+                                let _ = io::stderr().flush();
+                            }
 
                             // Print a timestamped re-scan header.
                             let now = chrono_timestamp();
