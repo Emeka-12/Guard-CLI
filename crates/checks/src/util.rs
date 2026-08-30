@@ -15,16 +15,38 @@ fn path_is_contractimpl(path: &syn::Path) -> bool {
         .is_some_and(|s| s.ident == "contractimpl")
 }
 
-/// Every function item inside a `#[contractimpl]` impl in the file.
-fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+/// Does `attrs` contain a `#[cfg(...)]` predicate that gates its item to test
+/// builds? Recognizes a bare `#[cfg(test)]` as well as `test` appearing
+/// alongside other predicates inside `all(...)` / `any(...)`, e.g.
+/// `#[cfg(all(test, not(target_arch = "wasm32")))]` or
+/// `#[cfg(any(test, doctest))]` — both common ways Soroban crates gate
+/// native-only test modules.
+///
+/// Deliberately does not look *inside* `not(...)`: `#[cfg(not(test))]` means
+/// "only when NOT testing" (i.e. production code), and treating it as test
+/// code would hide real code from every check that relies on this.
+pub(crate) fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("cfg") {
             return false;
         }
-        attr.parse_args::<syn::Ident>()
-            .map(|id| id == "test")
+        attr.parse_args::<syn::Meta>()
+            .map(|meta| meta_mentions_test(&meta))
             .unwrap_or(false)
     })
+}
+
+/// Does this `cfg` predicate mention the bare `test` identifier as one of
+/// its own terms, recursing through nested `all(...)` / `any(...)`?
+fn meta_mentions_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => list
+            .parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+            .map(|metas| metas.iter().any(meta_mentions_test))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// Every function item inside a `#[contractimpl]` impl that is **not** inside a
@@ -95,6 +117,77 @@ mod tests {
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].sig.ident.to_string(), "live");
         Ok(())
+    }
+
+    #[test]
+    fn excludes_contractimpl_functions_inside_cfg_all_test_not_wasm32_module() -> Result<(), syn::Error> {
+        let file = parse_file(
+            r#"
+#[contractimpl]
+impl C {
+    pub fn live(env: Env) {
+        let _ = env;
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod native {
+    use soroban_sdk::{contractimpl, Env};
+
+    #[contractimpl]
+    impl C {
+        pub fn test_only(env: Env) {
+            let _ = env;
+        }
+    }
+}
+"#,
+        )?;
+
+        let methods = contractimpl_functions_excluding_test(&file);
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].sig.ident.to_string(), "live");
+        Ok(())
+    }
+
+    #[test]
+    fn excludes_contractimpl_functions_inside_cfg_any_test_doctest_module() -> Result<(), syn::Error> {
+        let file = parse_file(
+            r#"
+#[contractimpl]
+impl C {
+    pub fn live(env: Env) {
+        let _ = env;
+    }
+}
+
+#[cfg(any(test, doctest))]
+mod integration {
+    use soroban_sdk::{contractimpl, Env};
+
+    #[contractimpl]
+    impl C {
+        pub fn test_only(env: Env) {
+            let _ = env;
+        }
+    }
+}
+"#,
+        )?;
+
+        let methods = contractimpl_functions_excluding_test(&file);
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].sig.ident.to_string(), "live");
+        Ok(())
+    }
+
+    #[test]
+    fn cfg_not_test_is_not_treated_as_test_code() {
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[cfg(not(test))])];
+        assert!(
+            !is_cfg_test(&attrs),
+            "`#[cfg(not(test))]` gates production-only code, not test code"
+        );
     }
 
     #[test]
