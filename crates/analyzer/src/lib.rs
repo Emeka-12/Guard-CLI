@@ -338,7 +338,6 @@ fn collect_rust_paths(
                 continue;
             }
         }
-        paths.push(path.to_path_buf());
     }
 
     Ok((paths, files_skipped))
