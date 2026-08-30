@@ -162,7 +162,11 @@ fn is_suppressed(finding: &Finding, suppressions: &Suppressions, fn_spans: &[FnS
     let impl_type = fn_spans
         .iter()
         .find(|s| {
-            s.function_name == finding.function_name
+            // When a check leaves function_name empty (e.g. unchecked-divisor,
+            // symbol-key-collision, mutable-global-state), fall back to line-range
+            // containment so a function-scoped suppression above the enclosing method
+            // still silences the finding.
+            (finding.function_name.is_empty() || s.function_name == finding.function_name)
                 && s.start_line <= finding.line
                 && finding.line <= s.end_line
         })
@@ -519,15 +523,12 @@ pub fn scan_files(
     let exclude_patterns = compile_globs(excludes)?;
     let include_patterns = compile_globs(includes)?;
 
-    let mut filtered: Vec<&PathBuf> = Vec::new();
-    let mut files_skipped = 0usize;
-    let mut files_skipped = 0;
     let mut selected: Vec<PathBuf> = Vec::new();
+    let mut files_skipped = 0usize;
     for path in paths {
         let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
         match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns)? {
-            PathVerdict::Scan => filtered.push(path),
             PathVerdict::Scan => selected.push(path_canon),
             PathVerdict::GeneratedSkip => files_skipped += 1,
             PathVerdict::Reject => {}
@@ -537,7 +538,7 @@ pub fn scan_files(
     let files_scanned = selected.len();
     let checks = default_checks();
 
-    let mut findings: Vec<Finding> = filtered
+    let mut findings: Vec<Finding> = selected
         .par_iter()
         .map(|path| run_checks_for_file(path, &root, &checks))
         .collect::<Result<Vec<Vec<Finding>>, ScanError>>()?
@@ -1027,6 +1028,45 @@ impl C {
         assert!(s
             .line_checks
             .contains(&(5, "unchecked-arithmetic".to_string())));
+    }
+
+    /// Regression test for #501: a function-scoped suppression above a method
+    /// must silence that method's findings even when the check leaves function_name
+    /// empty (e.g. unchecked-divisor, mutable-global-state, symbol-key-collision).
+    #[test]
+    fn function_scoped_suppression_silences_empty_function_name_findings() {
+        let src = "\
+#[contract]
+pub struct C;
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(unchecked-divisor)
+    pub fn divide(env: Env, a: u128, b: u128) -> u128 {
+        let _ = env;
+        a / b
+    }
+}
+";
+        let file = syn::parse_file(src).expect("fixture should parse");
+        let fn_spans = build_fn_spans(&file);
+        let suppressions = parse_suppressions(src, &fn_spans);
+
+        // Simulate an unchecked-divisor finding with an empty function_name,
+        // as some checks emit.
+        let finding = Finding {
+            check_name: "unchecked-divisor".to_string(),
+            severity: soroban_guard_checks::Severity::High,
+            file_path: String::new(),
+            line: 8,
+            function_name: String::new(),
+            description: "divisor not validated".to_string(),
+            rule_url: None,
+            suggestion: None,
+        };
+        assert!(
+            is_suppressed(&finding, &suppressions, &fn_spans),
+            "function-scoped suppression should silence finding with empty function_name"
+        );
     }
 }
 
