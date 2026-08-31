@@ -1,8 +1,8 @@
-use crate::util::{self, env_param_name, receiver_chain_contains, receiver_chain_contains_storage};
+use crate::util::{self, contractimpl_functions_excluding_test};
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Block, Expr, ExprMethodCall, ImplItem, ItemImpl, Pat};
+use syn::{Block, Expr, ExprMethodCall, Pat};
 
 const CHECK_NAME: &str = "unprotected-upgrade";
 const SENSITIVE_NAMES: &[&str] = &["upgrade", "migrate", "set_wasm", "replace_wasm"];
@@ -15,72 +15,43 @@ impl Check for UnprotectedUpgradeCheck {
     }
 
     fn run(&self, file: &syn::File, _source: &str) -> Vec<Finding> {
-        let mut visitor = UpgradeVisitor::default();
-        visit::visit_file(&mut visitor, file);
-        visitor.findings
-    }
-}
+        let mut out = Vec::new();
+        for method in contractimpl_functions_excluding_test(file) {
+            let name = method.sig.ident.to_string();
+            if is_sensitive_name(&name) && matches!(method.vis, syn::Visibility::Public(_)) {
+                let env_name = env_param_name(&method.sig).unwrap_or_else(|| "env".to_string());
+                let address_names = util::address_param_names(&method.sig);
+                let sensitive_line = first_invoke_wasm_line(&method.block);
+                let auth_line = first_valid_auth_line(method, &env_name, &address_names);
 
-#[derive(Default)]
-struct UpgradeVisitor {
-    findings: Vec<Finding>,
-}
+                let unprotected = match (sensitive_line, auth_line) {
+                    (Some(sensitive), Some(auth)) => auth >= sensitive,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
 
-impl<'ast> Visit<'ast> for UpgradeVisitor {
-    fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
-        if has_contractimpl_attr(&node.attrs) {
-            for item in &node.items {
-                if let ImplItem::Fn(method) = item {
-                    let name = method.sig.ident.to_string();
-                    if is_sensitive_name(&name) && matches!(method.vis, syn::Visibility::Public(_)) {
-                        let env_name = env_param_name(&method.sig).unwrap_or_else(|| "env".to_string());
-                        let address_names = util::address_param_names(&method.sig);
-                        let sensitive_line = first_invoke_wasm_line(&method.block);
-                        let auth_line = first_valid_auth_line(method, &env_name, &address_names);
-
-                        let unprotected = match (sensitive_line, auth_line) {
-                            (Some(sensitive), Some(auth)) => auth >= sensitive,
-                            (Some(_), None) => true,
-                            (None, _) => false,
-                        };
-
-                        if unprotected {
-                            self.findings.push(Finding {
-                                check_name: CHECK_NAME.to_string(),
-                                severity: Severity::High,
-                                file_path: String::new(),
-                                line: sensitive_line.unwrap_or_else(|| method.span().start().line),
-                                function_name: name.clone(),
-                                description: format!(
-                                    "Upgrade/migrate method `{}` lacks valid require_auth protection before the sensitive operation",
-                                    name
-                                ),
-                                rule_url: Some(
-                                    "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unprotected-upgrade-high"
-                                        .to_string(),
-                                ),
-                                suggestion: Some("Add env.require_auth() at the start".to_string()),
-                            });
-                        }
-                    }
+                if unprotected {
+                    out.push(Finding {
+                        check_name: CHECK_NAME.to_string(),
+                        severity: Severity::High,
+                        file_path: String::new(),
+                        line: sensitive_line.unwrap_or_else(|| method.sig.fn_token.span().start().line),
+                        function_name: name.clone(),
+                        description: format!(
+                            "Upgrade/migrate method `{}` lacks valid require_auth protection before the sensitive operation",
+                            name
+                        ),
+                        rule_url: Some(
+                            "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unprotected-upgrade-high"
+                                .to_string(),
+                        ),
+                        suggestion: Some("Add env.require_auth() at the start".to_string()),
+                    });
                 }
             }
         }
-        visit::visit_item_impl(self, node);
+        out
     }
-}
-
-fn has_contractimpl_attr(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        if let syn::Meta::Path(path) = &attr.meta {
-            path.segments
-                .last()
-                .map(|seg| seg.ident == "contractimpl")
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    })
 }
 
 fn is_sensitive_name(name: &str) -> bool {
@@ -307,6 +278,35 @@ impl C {
         let check = UnprotectedUpgradeCheck;
         let findings = check.run(&file, src);
         assert!(findings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_methods_inside_cfg_test() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn upgrade(env: Env, new_code: Bytes) {
+        env.invoke_wasm(&new_code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use soroban_sdk::{contractimpl, Env, Bytes};
+
+    #[contractimpl]
+    impl C {
+        pub fn upgrade(env: Env, new_code: Bytes) {
+            env.invoke_wasm(&new_code);
+        }
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = UnprotectedUpgradeCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 1);
         Ok(())
     }
 }

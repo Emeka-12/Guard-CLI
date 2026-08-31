@@ -10,7 +10,7 @@ use crate::util::contractimpl_functions_excluding_test;
 use crate::{Check, Finding, Severity};
 use std::collections::HashSet;
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprMethodCall, File, Pat, Stmt};
+use syn::{Expr, ExprMethodCall, File, Item, Pat, Stmt};
 
 const CHECK_NAME: &str = "missing-balance-check";
 
@@ -23,9 +23,13 @@ impl Check for MissingBalanceCheck {
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
+        let token_client_aliases = collect_token_client_aliases(file);
         for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
-            let mut scan = BodyScan::default();
+            let mut scan = BodyScan {
+                token_client_aliases: token_client_aliases.clone(),
+                ..Default::default()
+            };
             scan.visit_block(&method.block);
 
             let mut transfers = scan.transfers;
@@ -79,8 +83,11 @@ impl Check for MissingBalanceCheck {
 /// evaluation is done in the caller after the walk finishes.
 #[derive(Default)]
 struct BodyScan {
-    /// Local bindings initialised from `token::Client::new(...)` / `TokenClient::new(...)`.
+    /// Local bindings initialised from `token::Client::new(...)` / `TokenClient::new(...)`
+    /// (or an aliased client type, e.g. `use ...::Client as Tok; Tok::new(...)`).
     token_bindings: HashSet<String>,
+    /// Alias idents (`Tok`) that map to `Client` / `TokenClient` via `use ... as`.
+    token_client_aliases: HashSet<String>,
     transfers: Vec<(usize, usize)>,
     balances: Vec<(usize, usize)>,
 }
@@ -91,7 +98,7 @@ impl<'ast> Visit<'ast> for BodyScan {
         // them. Re-binding the same name to something else clears the entry.
         if let Stmt::Local(local) = stmt {
             if let (Some(name), Some(init)) = (binding_ident(&local.pat), &local.init) {
-                if expr_is_token_client_ctor(&init.expr) {
+                if expr_is_token_client_ctor(&init.expr, &self.token_client_aliases) {
                     self.token_bindings.insert(name);
                 } else {
                     self.token_bindings.remove(&name);
@@ -137,11 +144,39 @@ fn ident_of(e: &Expr) -> Option<String> {
     }
 }
 
-/// Is `expr` a call to `token::Client::new(...)`, `TokenClient::new(...)`, or any path
-/// ending in `Client::new` / `TokenClient::new`? Also looks through a leading `&`.
-fn expr_is_token_client_ctor(expr: &Expr) -> bool {
+/// Collect every `use ...::Client as X` / `use ...::TokenClient as X` alias so a renamed
+/// token-client type (`Tok::new(...)`) is still recognised as a token-client constructor.
+fn collect_token_client_aliases(file: &File) -> HashSet<String> {
+    let mut aliases = HashSet::new();
+    for item in &file.items {
+        if let Item::Use(use_item) = item {
+            collect_aliases_from_use_tree(&use_item.tree, &mut aliases);
+        }
+    }
+    aliases
+}
+
+fn collect_aliases_from_use_tree(tree: &syn::UseTree, out: &mut HashSet<String>) {
+    if let Some(rename) = &tree.rename {
+        if let Some(last) = tree.prefix.segments.last() {
+            if last.ident == "Client" || last.ident == "TokenClient" {
+                out.insert(rename.ident.to_string());
+            }
+        }
+    }
+    if let Some(group) = &tree.group {
+        for nested in group {
+            collect_aliases_from_use_tree(nested, out);
+        }
+    }
+}
+
+/// Is `expr` a call to `token::Client::new(...)`, `TokenClient::new(...)`, an aliased client
+/// type (`Tok::new(...)` where `Tok` aliases `Client`/`TokenClient`), or any path ending in
+/// `Client::new` / `TokenClient::new`? Also looks through a leading `&`.
+fn expr_is_token_client_ctor(expr: &Expr, aliases: &HashSet<String>) -> bool {
     match expr {
-        Expr::Reference(r) => expr_is_token_client_ctor(&r.expr),
+        Expr::Reference(r) => expr_is_token_client_ctor(&r.expr, aliases),
         Expr::Call(call) => {
             let Expr::Path(p) = &*call.func else {
                 return false;
@@ -152,7 +187,7 @@ fn expr_is_token_client_ctor(expr: &Expr) -> bool {
                 return false;
             }
             let ty = &segs[n - 2].ident;
-            ty == "Client" || ty == "TokenClient"
+            ty == "Client" || ty == "TokenClient" || aliases.contains(&ty.to_string())
         }
         _ => false,
     }
@@ -283,5 +318,23 @@ impl C {
 }
 "#;
         assert!(finding_lines(src).is_empty());
+    }
+
+    #[test]
+    fn recognizes_aliased_token_client_import() {
+        // #515: `use soroban_sdk::token::Client as Tok; Tok::new(...)` must be
+        // recognised as a token-client constructor so transfers are balance-checked.
+        let src = r#"
+use soroban_sdk::token::Client as Tok;
+
+#[contractimpl]
+impl C {
+    pub fn send(env: Env) {
+        let token = Tok::new(&env, &id);
+        token.transfer(&sender, &recv, &amount);
+    }
+}
+"#;
+        assert_eq!(finding_lines(src).len(), 1);
     }
 }
