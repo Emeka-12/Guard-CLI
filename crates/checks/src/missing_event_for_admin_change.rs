@@ -1,3 +1,4 @@
+use crate::util::receiver_chain_contains_events;
 use crate::util::receiver_chain_contains_storage;
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
@@ -120,7 +121,7 @@ struct EventVisitor {
 
 impl<'ast> Visit<'ast> for EventVisitor {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if node.method == "publish" {
+        if node.method == "publish" && receiver_chain_contains_events(&node.receiver) {
             self.found_event = true;
         }
         visit::visit_expr_method_call(self, node);
