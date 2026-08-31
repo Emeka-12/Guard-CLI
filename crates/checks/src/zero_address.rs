@@ -319,6 +319,7 @@ impl C {
     }
 
     #[test]
+    fn unrelated_validate_does_not_suppress_finding() {
     fn passes_when_require_auth_and_real_comparison_present() {
         let hits = run(r#"
 use soroban_sdk::{contractimpl, Env, Address};
@@ -343,6 +344,7 @@ pub struct C;
 #[contractimpl]
 impl C {
     pub fn set_admin(env: Env, admin: Address) {
+        self.validate_fee_config();
         assert!(!admin.is_zero());
         env.storage().instance().set(&"admin", &admin);
     }

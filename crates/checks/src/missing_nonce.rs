@@ -193,6 +193,24 @@ impl C {
     }
 
     #[test]
+    fn ignores_local_vec_push() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn update(env: Env, user: Address, new_val: u32) {
+        let mut log: Vec<u32> = Vec::new(&env);
+        log.push_back(new_val);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingNonceCheck;
+        let findings = check.run(&file, src);
+        assert!(findings.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn ignores_with_nonce() -> Result<(), syn::Error> {
         let src = r#"
 #[contractimpl]

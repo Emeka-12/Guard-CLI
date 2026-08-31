@@ -58,7 +58,7 @@ impl Check for UnprotectedTokenMintCheck {
 }
 
 fn is_mint_name(name: &str) -> bool {
-    MINT_NAMES.iter().any(|&m| name.contains(m))
+    MINT_NAMES.contains(&name)
 }
 
 fn first_storage_mutation_line(block: &Block) -> Option<usize> {
@@ -242,6 +242,23 @@ impl C {
     pub fn mint(env: Env, to: Address, amount: u128) {
         env.require_auth();
         env.storage().instance().set(&symbol_short!("supply"), &amount);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = UnprotectedTokenMintCheck;
+        let findings = check.run(&file, src);
+        assert!(findings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn passes_for_read_only_getter_total_minted() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn total_minted(env: Env) -> i128 {
+        env.storage().instance().get(&symbol_short!("supply")).unwrap_or(0)
     }
 }
         "#;
