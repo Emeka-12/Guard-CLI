@@ -84,7 +84,7 @@ fn has_contractimpl_attr(attrs: &[syn::Attribute]) -> bool {
 }
 
 fn is_sensitive_name(name: &str) -> bool {
-    SENSITIVE_NAMES.iter().any(|&s| name.contains(s))
+    SENSITIVE_NAMES.contains(&name)
 }
 
 fn first_invoke_wasm_line(block: &Block) -> Option<usize> {
@@ -271,6 +271,23 @@ impl C {
         let check = UnprotectedUpgradeCheck;
         let findings = check.run(&file, src);
         assert_eq!(findings.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn passes_for_read_only_getter_upgrade_pending() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn upgrade_pending(env: Env) -> bool {
+        env.storage().instance().get(&symbol_short!("upgraded")).unwrap_or(false)
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = UnprotectedUpgradeCheck;
+        let findings = check.run(&file, src);
+        assert!(findings.is_empty());
         Ok(())
     }
 

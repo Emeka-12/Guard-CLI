@@ -72,8 +72,6 @@ impl<'ast> Visit<'ast> for BodyScan {
             || name.contains("zero")
             || name.contains("default")
             || name.contains("check_address")
-            || name.contains("assert")
-            || name.contains("validate")
         {
             self.has_guard = true;
         }
@@ -200,6 +198,23 @@ impl C {
 }
 "#);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn unrelated_validate_does_not_suppress_finding() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn set_admin(env: Env, admin: Address) {
+        self.validate_fee_config();
+        env.storage().instance().set(&"admin", &admin);
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].function_name, "set_admin");
     }
 
     #[test]

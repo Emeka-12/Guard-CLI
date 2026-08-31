@@ -91,7 +91,7 @@ impl<'ast> Visit<'ast> for StorageWriteVisitor {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if matches!(
             node.method.to_string().as_str(),
-            "set" | "remove" | "append" | "push" | "push_back"
+            "set" | "remove" | "append"
         ) {
             self.found_write = true;
         }
@@ -149,6 +149,24 @@ impl C {
         let findings = check.run(&file, src);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].check_name, "missing-nonce");
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_local_vec_push() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn update(env: Env, user: Address, new_val: u32) {
+        let mut log: Vec<u32> = Vec::new(&env);
+        log.push_back(new_val);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingNonceCheck;
+        let findings = check.run(&file, src);
+        assert!(findings.is_empty());
         Ok(())
     }
 
