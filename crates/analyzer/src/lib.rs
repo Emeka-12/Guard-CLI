@@ -342,7 +342,6 @@ fn collect_rust_paths(
                 continue;
             }
         }
-        paths.push(path.to_path_buf());
     }
 
     Ok((paths, files_skipped))
@@ -523,12 +522,18 @@ pub fn scan_files(
     let exclude_patterns = compile_globs(excludes)?;
     let include_patterns = compile_globs(includes)?;
 
+    let mut filtered: Vec<&PathBuf> = Vec::new();
+    let mut files_skipped = 0usize;
     let mut selected: Vec<PathBuf> = Vec::new();
     let mut files_skipped = 0usize;
     for path in paths {
         let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
         match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns)? {
+            PathVerdict::Scan => {
+                filtered.push(path);
+                selected.push(path_canon);
+            }
             PathVerdict::Scan => selected.push(path_canon),
             PathVerdict::GeneratedSkip => files_skipped += 1,
             PathVerdict::Reject => {}
