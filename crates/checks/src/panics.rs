@@ -1,6 +1,6 @@
 //! Panic-in-contract: `panic!`, `unwrap()`, `expect(…)`, `unreachable!()` in contract methods.
 
-use crate::util::contractimpl_functions_excluding_test;
+use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -21,19 +21,6 @@ fn is_storage_get(expr: &Expr) -> bool {
             (m.method == "get" || m.method == "get_unchecked")
                 && receiver_chain_contains_storage(&m.receiver)
         }
-        _ => false,
-    }
-}
-
-fn receiver_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "storage" {
-                return true;
-            }
-            receiver_chain_contains_storage(&m.receiver)
-        }
-        Expr::Field(f) => receiver_chain_contains_storage(&f.base),
         _ => false,
     }
 }
