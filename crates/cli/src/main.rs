@@ -1,4 +1,4 @@
-mod config;
+use soroban_guard_cli::config;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -8,7 +8,7 @@ use soroban_guard_analyzer::scan_directory_with_checks;
 use soroban_guard_checks::{default_checks, default_checks_with_config, Finding, Severity};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -65,6 +65,9 @@ enum Commands {
         /// Watch for .rs file changes and re-run the scan automatically
         #[arg(long, short = 'w')]
         watch: bool,
+        /// Cap the number of findings printed to stdout (0 = unlimited, default: 0)
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        max_findings: usize,
     },
     /// List the checks that are enabled by default
     ListChecks,
@@ -94,6 +97,7 @@ struct ScanOptions {
     fail_threshold: Severity,
     exclude: Vec<String>,
     includes: Vec<String>,
+    max_findings: usize,
 }
 
 /// Whether scan results should be printed. `--quiet` suppresses output only while the
@@ -157,8 +161,9 @@ fn run_scan(
                     }
                 }
             } else if should_print_results(opts.quiet, should_fail) {
-                let (display, truncated) = truncate(&findings, 0);
+                let (display, truncated) = truncate(&findings, opts.max_findings);
                 print_pretty(
+                    &findings,
                     display,
                     files_scanned,
                     opts.path.display().to_string(),
@@ -243,6 +248,20 @@ fn is_leap(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
+/// Parse a `--fail-on` / `min_severity` string into a `Severity`.
+///
+/// Returns `Ok(Severity)` for `"high"`, `"medium"`, or `"low"` (case-insensitive).
+/// Returns `Err(original_value)` for anything else so the caller can emit a
+/// helpful `error:` message and exit 2.
+fn parse_fail_on(value: &str) -> Result<Severity, &str> {
+    match value.to_lowercase().as_str() {
+        "high" => Ok(Severity::High),
+        "medium" => Ok(Severity::Medium),
+        "low" => Ok(Severity::Low),
+        _ => Err(value),
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -260,6 +279,7 @@ fn main() {
             fail_on,
             disable_check,
             watch,
+            max_findings,
         } => {
             if no_color || std::env::var_os("NO_COLOR").is_some() {
                 colored::control::set_override(false);
@@ -311,10 +331,16 @@ fn main() {
             } else {
                 cfg.scan.min_severity.clone().unwrap_or(fail_on.clone())
             };
-            let fail_threshold = match effective_fail_on.to_lowercase().as_str() {
-                "medium" => Severity::Medium,
-                "low" => Severity::Low,
-                _ => Severity::High,
+            let fail_threshold = match parse_fail_on(&effective_fail_on) {
+                Ok(sev) => sev,
+                Err(bad) => {
+                    eprintln!(
+                        "{} unknown --fail-on value `{}`. Expected one of: high, medium, low",
+                        "error:".red().bold(),
+                        bad
+                    );
+                    std::process::exit(2);
+                }
             };
 
             // Merge config disabled list with --disable-check flags.
@@ -359,6 +385,7 @@ fn main() {
                 fail_threshold,
                 exclude: exclude.clone(),
                 includes: include.clone(),
+                max_findings,
             };
 
             // Run the initial scan.
@@ -444,11 +471,20 @@ fn main() {
                                 }
                             }
 
-                            // Clear terminal for a clean view.
-                            print!("\x1B[2J\x1B[1;1H");
-                            // Flush so the clear sequence happens in order relative to the
-                            // stderr header on the next line.
-                            let _ = io::stdout().flush();
+                            // Clear terminal for a clean view — only when output is
+                            // going to a human-readable TTY and is not a structured
+                            // format (--json / --sarif / --output).  Send to stderr so
+                            // stdout stays clean for machine consumers.
+                            let stdout_is_tty = std::io::stdout().is_terminal();
+                            let should_clear = !no_clear
+                                && !json
+                                && !sarif
+                                && output.is_none()
+                                && stdout_is_tty;
+                            if should_clear {
+                                eprint!("\x1B[2J\x1B[1;1H");
+                                let _ = io::stderr().flush();
+                            }
 
                             // Print a timestamped re-scan header.
                             let now = chrono_timestamp();
@@ -860,15 +896,21 @@ fn hyperlink(url: &str, text: &str) -> String {
 }
 
 fn style_check_name(check_name: &str, severity: Severity) -> String {
-    match severity {
-        Severity::High => check_name.red().bold().to_string(),
-        Severity::Medium => check_name.magenta().to_string(),
-        Severity::Low => check_name.white().dimmed().to_string(),
+    if std::env::var_os("NO_COLOR").is_some() {
+        return check_name.to_string();
     }
+
+    let prefix = match severity {
+        Severity::High => "\u{1b}[31m\u{1b}[1m",
+        Severity::Medium => "\u{1b}[35m",
+        Severity::Low => "\u{1b}[2m",
+    };
+    format!("{prefix}{check_name}\u{1b}[0m")
 }
 
 fn print_pretty(
     findings: &[Finding],
+    display: &[Finding],
     files_scanned: usize,
     root_label: String,
     truncated_count: usize,
@@ -881,17 +923,17 @@ fn print_pretty(
     );
     println!();
 
-    if findings.is_empty() && truncated_count == 0 {
+    if display.is_empty() && truncated_count == 0 {
         println!("  {}", "No issues found.".green());
         println!();
     } else {
-        let total = findings.len() + truncated_count;
+        let total = display.len() + truncated_count;
         println!(
             "  {} finding(s):\n",
             total.to_string().yellow().bold()
         );
 
-        for (i, f) in findings.iter().enumerate() {
+        for (i, f) in display.iter().enumerate() {
             let sev = match f.severity {
                 Severity::High => "HIGH".red().bold(),
                 Severity::Medium => "MEDIUM".magenta().bold(),
@@ -1206,20 +1248,76 @@ mod tests {
     }
 
     #[test]
+    fn truncate_limits_display_when_max_is_smaller_than_findings() {
+        let findings = vec![
+            sample_finding("check-a", Severity::High, 1),
+            sample_finding("check-b", Severity::Medium, 2),
+            sample_finding("check-c", Severity::Low, 3),
+        ];
+
+        let (display, truncated) = truncate(&findings, 2);
+        assert_eq!(display.len(), 2, "only max findings should be displayed");
+        assert_eq!(truncated, 1, "the rest should be reported as truncated");
+        assert_eq!(display[0].check_name, "check-a");
+        assert_eq!(display[1].check_name, "check-b");
+    }
+
+    #[test]
+    fn truncate_zero_returns_all_findings_untouched() {
+        let findings = vec![
+            sample_finding("check-a", Severity::High, 1),
+            sample_finding("check-b", Severity::Medium, 2),
+        ];
+
+        let (display, truncated) = truncate(&findings, 0);
+        assert_eq!(display.len(), 2, "max 0 must not truncate");
+        assert_eq!(truncated, 0);
+        assert!(std::ptr::eq(display, &findings[..]), "max 0 should return the full slice");
+    }
+
+    #[test]
+    fn truncate_is_a_no_op_when_findings_fit_within_max() {
+        let findings = vec![sample_finding("check-a", Severity::High, 1)];
+
+        let (display, truncated) = truncate(&findings, 5);
+        assert_eq!(display.len(), 1);
+        assert_eq!(truncated, 0);
+    }
+
+    #[test]
+    fn summary_line_counts_full_result_set_after_truncation() {
+        let findings = vec![
+            sample_finding("check-a", Severity::High, 1),
+            sample_finding("check-b", Severity::Medium, 2),
+            sample_finding("check-c", Severity::Low, 3),
+        ];
+
+        let (display, truncated) = truncate(&findings, 2);
+        assert_eq!(display.len(), 2);
+        assert_eq!(truncated, 1);
+        // The summary must be computed over the complete findings list, not the
+        // truncated slice shown to the user (Issue #414).
+        assert_eq!(
+            summary_text(&findings, 4),
+            "1 High, 1 Medium, 1 Low — across 4 file(s)"
+        );
+    }
+
+    #[test]
     fn check_name_styling_is_bold_for_high_and_dimmed_for_low() {
         control::set_override(true);
         let high = style_check_name("high-check", Severity::High);
         let low = style_check_name("low-check", Severity::Low);
 
-        assert!(high.contains("\u{1b}[1m"), "high check name should be bold");
-        assert!(low.contains("\u{1b}[2m"), "low check name should be dimmed");
+        assert!(high.contains("\u{1b}[1;31m"), "high check name should be bold red");
+        assert!(low.contains("\u{1b}[2;37m"), "low check name should be dimmed white");
     }
 
     #[test]
     fn describe_check_covers_all_default_checks() {
         for check in default_checks() {
             let (sev, desc) = describe_check(check.name());
-            assert_ne!(sev, "low", "check {} has fallback severity", check.name());
+            assert!(matches!(sev, "high" | "medium" | "low"), "check {} has invalid severity metadata", check.name());
             assert_ne!(desc, "Custom detector", "check {} has fallback description", check.name());
         }
     }
@@ -1286,5 +1384,61 @@ mod tests {
         let passing = [sample_finding("some-check", Severity::Low, 1)];
         let passes_high = passing.iter().any(|f| f.severity <= Severity::High);
         assert!(!should_print_results(true, passes_high));
+    }
+
+    // ── parse_fail_on ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_fail_on_accepts_known_values() {
+        assert_eq!(parse_fail_on("high"), Ok(Severity::High));
+        assert_eq!(parse_fail_on("medium"), Ok(Severity::Medium));
+        assert_eq!(parse_fail_on("low"), Ok(Severity::Low));
+    }
+
+    #[test]
+    fn parse_fail_on_is_case_insensitive() {
+        assert_eq!(parse_fail_on("HIGH"), Ok(Severity::High));
+        assert_eq!(parse_fail_on("Medium"), Ok(Severity::Medium));
+        assert_eq!(parse_fail_on("LOW"), Ok(Severity::Low));
+    }
+
+    #[test]
+    fn parse_fail_on_rejects_unknown_string() {
+        assert!(parse_fail_on("medim").is_err(), "typo should be rejected");
+        assert!(parse_fail_on("none").is_err(), "'none' should be rejected");
+        assert!(parse_fail_on("critical").is_err(), "'critical' should be rejected");
+        assert!(parse_fail_on("").is_err(), "empty string should be rejected");
+    }
+
+    // ── CLI integration: bad --fail-on exits 2 ───────────────────────────────
+
+    #[test]
+    fn bad_fail_on_flag_exits_2() {
+        // Build the binary path relative to the workspace root.
+        let mut bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        bin.push("../../target/debug/soroban-guard");
+
+        // If the binary hasn't been built yet, skip rather than panic.
+        if !bin.exists() {
+            eprintln!("note: skipping bad_fail_on_flag_exits_2 — binary not found at {}", bin.display());
+            return;
+        }
+
+        let output = std::process::Command::new(&bin)
+            .args(["scan", ".", "--fail-on", "medim"])
+            .output()
+            .expect("failed to run soroban-guard binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "bad --fail-on value should exit 2, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unknown --fail-on value"),
+            "stderr should contain 'unknown --fail-on value', got: {stderr}"
+        );
     }
 }

@@ -1,11 +1,14 @@
 //! Detect a `require_auth()` call - on the `Env` parameter or on an `Address`
 //! parameter - made *after* a storage write in `#[contractimpl]` methods.
 
-use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
+use crate::util::{
+    contractimpl_functions_excluding_test, receiver_chain_contains_storage, receiver_is_auth_gate,
+};
 use crate::{Check, Finding, Severity};
+use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Block, Expr, ExprMethodCall, File, FnArg, Pat, Type};
+use syn::{Block, Expr, ExprMethodCall, File, FnArg, Pat, Stmt, Type};
 
 const CHECK_NAME: &str = "auth-after-storage-write";
 
@@ -110,15 +113,30 @@ fn is_storage_mutation_call(m: &ExprMethodCall) -> bool {
     receiver_chain_contains_storage(&m.receiver)
 }
 
-fn is_require_auth_call(m: &ExprMethodCall, env_name: &str, address_names: &[String]) -> bool {
+fn is_require_auth_call(
+    m: &ExprMethodCall,
+    env_name: &str,
+    address_names: &[String],
+    address_locals: &HashSet<String>,
+) -> bool {
     if m.method != "require_auth" && m.method != "require_auth_for_args" {
         return false;
     }
-    match &*m.receiver {
-        Expr::Path(p) => {
-            p.path.is_ident(env_name) || address_names.iter().any(|a| p.path.is_ident(a))
+    receiver_is_auth_gate(&m.receiver, env_name, address_names, address_locals)
+}
+
+/// Name bound by a `let` pattern whose (possibly annotated) type is `Address`.
+fn address_local_binding(pat: &Pat) -> Option<String> {
+    match pat {
+        Pat::Type(pt) => {
+            if type_is_address(&pt.ty) {
+                address_local_binding(&pt.pat)
+            } else {
+                None
+            }
         }
-        _ => false,
+        Pat::Ident(pi) => Some(pi.ident.to_string()),
+        _ => None,
     }
 }
 
@@ -145,22 +163,39 @@ struct FirstRequireAuth {
     line: Option<usize>,
     env_name: String,
     address_names: Vec<String>,
+    address_locals: HashSet<String>,
 }
 
 impl<'ast> Visit<'ast> for FirstRequireAuth {
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        if let Stmt::Local(local) = stmt {
+            if let (Some(name), Some(_init)) = (address_local_binding(&local.pat), &local.init) {
+                self.address_locals.insert(name);
+            }
+        }
+        visit::visit_stmt(self, stmt);
+    }
+
     fn visit_expr_method_call(&mut self, i: &'ast ExprMethodCall) {
-        if self.line.is_none() && is_require_auth_call(i, &self.env_name, &self.address_names) {
+        if self.line.is_none()
+            && is_require_auth_call(i, &self.env_name, &self.address_names, &self.address_locals)
+        {
             self.line = Some(i.span().start().line);
         }
         visit::visit_expr_method_call(self, i);
     }
 }
 
-fn first_require_auth_line(block: &Block, env_name: &str, address_names: &[String]) -> Option<usize> {
+fn first_require_auth_line(
+    block: &Block,
+    env_name: &str,
+    address_names: &[String],
+) -> Option<usize> {
     let mut v = FirstRequireAuth {
         line: None,
         env_name: env_name.to_string(),
         address_names: address_names.to_vec(),
+        address_locals: HashSet::new(),
     };
     v.visit_block(block);
     v.line
@@ -223,5 +258,76 @@ impl C {
 }
 "#);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn flags_self_field_require_auth_after_storage_write() {
+        // #514: `self.admin.require_auth()` has an `Expr::Field` receiver and must
+        // be recognized as a valid auth gate, so a post-write call is still flagged.
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn set_value(env: Env, value: i128) {
+        env.storage().persistent().set(&0, &value);
+        self.admin.require_auth();
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].check_name, CHECK_NAME);
+    }
+
+    #[test]
+    fn flags_cloned_address_require_auth_after_storage_write() {
+        // #514: `admin.clone().require_auth()` has an `Expr::MethodCall` receiver.
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Address, Env};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn set_value(env: Env, admin: Address, value: i128) {
+        env.storage().persistent().set(&0, &value);
+        admin.clone().require_auth();
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].check_name, CHECK_NAME);
+    }
+
+    #[test]
+    fn passes_when_self_field_require_auth_precedes_storage_write() {
+        // #514: a properly ordered `self.admin.require_auth()` must not be flagged.
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn set_value(env: Env, value: i128) {
+        self.admin.require_auth();
+        env.storage().persistent().set(&0, &value);
+    }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn passes_when_cloned_address_require_auth_precedes_storage_write() {
+        // #514: a properly ordered `admin.clone().require_auth()` must not be flagged.
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Address, Env};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn set_value(env: Env, admin: Address, value: i128) {
+        admin.clone().require_auth();
+        env.storage().persistent().set(&0, &value);
+    }
+}
+"#);
+        assert!(hits.is_empty());
     }
 }

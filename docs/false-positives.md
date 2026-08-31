@@ -21,6 +21,9 @@ Common causes:
   or contracts that use temporary storage for short-lived values by design.
 - **Naming coincidences** — a function named `init` that is not a one-time initializer, or a
   variable named `balance` that is unrelated to token math.
+- **Storage handle bound to a local** — a `.storage()` / `.persistent()` / `.temporary()`
+  handle stored in a local variable defeats every check that walks the receiver chain
+  (see issue [#502](https://github.com/SorobanGuard/Guard-CLI/issues/502)).
 
 ---
 
@@ -28,28 +31,28 @@ Common causes:
 
 | Check | Known false-positive sources | Full details |
 |---|---|---|
-| `missing-require-auth` | Auth delegated to a helper function; `Env` param named something other than `env` | [checks.md#missing-require-auth](checks.md#missing-require-auth) |
+| `missing-require-auth` | Auth delegated to a helper function; `Env` param named something other than `env`; storage handle bound to a local variable is not tracked | [checks.md#missing-require-auth](checks.md#missing-require-auth) |
 | `unchecked-arithmetic` | Severity is name-based; a variable named `amount` in non-financial context gets High. A `checked_*`/`saturating_*` call on a pair of operands suppresses unchecked binary operations on the *same* operands anywhere in the function body, even if the unchecked operation is not actually guarded by that specific check. | [checks.md#unchecked-arithmetic](checks.md#unchecked-arithmetic) |
-| `auth-after-storage-write` | Auth performed by a helper function is not tracked | [checks.md#auth-after-storage-write](checks.md#auth-after-storage-write) |
+| `auth-after-storage-write` | Auth performed by a helper function is not tracked; storage handle bound to a local variable is not tracked | [checks.md#auth-after-storage-write](checks.md#auth-after-storage-write) |
 | `unchecked-arithmetic` | Severity is name-based; a variable named `amount` in non-financial context gets High | [checks.md#unchecked-arithmetic](checks.md#unchecked-arithmetic) |
 | `unprotected-admin` | Any `require_auth` anywhere in the body clears the finding; auth inside a helper is not seen | [checks.md#unprotected-admin](checks.md#unprotected-admin) |
-| `unsafe-storage-patterns` | `Symbol::new` with a `const` or macro-expanded literal may be flagged as a dynamic key | [checks.md#unsafe-storage-patterns](checks.md#unsafe-storage-patterns) |
-| `missing-ttl-extension` | TTL extension performed by a helper function is not tracked | — |
+| `unsafe-storage-patterns` | `Symbol::new` with a `const` or macro-expanded literal may be flagged as a dynamic key; storage handle bound to a local variable is not tracked | [checks.md#unsafe-storage-patterns](checks.md#unsafe-storage-patterns) |
+| `missing-ttl-extension` | TTL extension performed by a helper function is not tracked; storage handle bound to a local variable is not tracked | — |
 | `forbidden-std-imports` | None known yet | [checks.md#forbidden-std-imports](checks.md#forbidden-std-imports) |
 | `hardcoded-address` | Only string literals beginning with `G` are recognized as Stellar public keys | [checks.md#hardcoded-address](checks.md#hardcoded-address) |
 | `unsafe-cross-contract-input` | Validation in a helper called after the assignment is not tracked | [checks.md#unsafe-cross-contract-input](checks.md#unsafe-cross-contract-input) |
 | `missing-contract-annotation` | Contract declarations split across files are not resolved | [checks.md#missing-contract-annotation](checks.md#missing-contract-annotation) |
 | `delegate-call-risk` | Intentional proxy patterns that read a callee from storage are flagged by design | [checks.md#delegate-call-risk](checks.md#delegate-call-risk) |
 | `integer-division-truncation` | Any division with a non-literal operand is flagged regardless of the rounding strategy | [checks.md#integer-division-truncation](checks.md#integer-division-truncation) |
-| `missing-event-emission` | Events emitted inside a helper called from the flagged method are not detected | [checks.md#missing-event-emission](checks.md#missing-event-emission) |
+| `missing-event-emission` | Events emitted inside a helper called from the flagged method are not detected; storage handle bound to a local variable is not tracked | [checks.md#missing-event-emission](checks.md#missing-event-emission) |
 | `symbol-key-collision` | Only duplicate `symbol_short!` keys within the same impl block are detected | [checks.md#symbol-key-collision](checks.md#symbol-key-collision) |
 | `self-transfer` | Complex or helper-based sender/recipient guards may not be recognized | [checks.md#self-transfer](checks.md#self-transfer) |
 | `missing-zero-address-check` | Validation performed by a helper function is not tracked | [checks.md#missing-zero-address-check](checks.md#missing-zero-address-check) |
 | `mutable-global-state` | None known yet | [checks.md#mutable-global-state](checks.md#mutable-global-state) |
-| `re-initialization-risk` | Any `.has()` / `.is_some()` in the body clears the finding regardless of control-flow | [checks.md#re-initialization-risk](checks.md#re-initialization-risk) |
+| `re-initialization-risk` | Any `.has()` / `.is_some()` in the body clears the finding regardless of control-flow; storage handle bound to a local variable is not tracked | [checks.md#re-initialization-risk](checks.md#re-initialization-risk) |
 | `unchecked-invoke-return` | Return values evaluated via complex helper methods may not be tracked | [checks.md#unchecked-invoke-return](checks.md#unchecked-invoke-return) |
 | `missing-balance-check` | `balance()` on an unrelated client clears the finding | [checks.md#missing-balance-check](checks.md#missing-balance-check) |
-| `unbounded-vec-growth` | Any `.len()` call in the function clears the finding even without a cap | [checks.md#unbounded-vec-growth](checks.md#unbounded-vec-growth) |
+| `unbounded-vec-growth` | Any `.len()` call in the function clears the finding even without a cap; storage handle bound to a local variable is not tracked | [checks.md#unbounded-vec-growth](checks.md#unbounded-vec-growth) |
 | `unsafe-randomness` | `env.ledger().timestamp()` alone is flagged even if the value is never used in logic | [checks.md#unsafe-randomness](checks.md#unsafe-randomness) |
 | `unchecked-divisor` | Any literal divisor is skipped; complex runtime guards are not tracked | [checks.md#unchecked-divisor](checks.md#unchecked-divisor) |
 | `panic-in-contract` | Intentional panics and unwraps in unreachable paths are still flagged | [checks.md#panic-in-contract](checks.md#panic-in-contract) |
@@ -60,7 +63,7 @@ Common causes:
 | `large-loop` | None known yet | [checks.md#large-loop](checks.md#large-loop) |
 | `missing-nonce` | Nonce validation performed by a helper function is not tracked | [checks.md#missing-nonce](checks.md#missing-nonce) |
 | `uninitialized-storage-read` | Initialization checks performed by a helper function are not tracked | [checks.md#uninitialized-storage-read](checks.md#uninitialized-storage-read) |
-| `reentrancy-risk` | Branch-sensitive control flow and helper calls are not tracked | [checks.md#reentrancy-risk](checks.md#reentrancy-risk) |
+| `reentrancy-risk` | Branch-sensitive control flow and helper calls are not tracked; storage handle bound to a local variable is not tracked | [checks.md#reentrancy-risk](checks.md#reentrancy-risk) |
 | `missing-event-for-admin-change` | Events emitted by a helper function are not detected | — |
 | `missing-input-length-bound` | Length validation performed by a helper function is not tracked | — |
 

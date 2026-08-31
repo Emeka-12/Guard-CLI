@@ -1,6 +1,7 @@
 //! Hardcoded Stellar address strings (`G...` or `C...`, 56 chars) baked into contract source.
 
 use crate::{Check, Finding, Severity};
+use syn::spanned::Spanned;
 use syn::File;
 
 const CHECK_NAME: &str = "hardcoded-address";
@@ -17,16 +18,22 @@ impl Check for HardcodedAddressCheck {
         CHECK_NAME
     }
 
-    fn run(&self, _file: &File, source: &str) -> Vec<Finding> {
+    fn run(&self, file: &File, source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for (idx, line) in source.lines().enumerate() {
-            for key in find_candidate_keys(line) {
+        let spans = function_spans(file);
+        for (idx, line) in effective_lines(source).into_iter().enumerate() {
+            let raw_line = source.lines().nth(idx).unwrap_or("");
+            if raw_line.trim_start().starts_with("#[doc") {
+                continue;
+            }
+            for key in find_candidate_keys(&line) {
+                let line_no = idx + 1;
                 out.push(Finding {
                     check_name: CHECK_NAME.to_string(),
                     severity: Severity::Medium,
                     file_path: String::new(),
-                    line: idx + 1,
-                    function_name: "module".to_string(),
+                    line: line_no,
+                    function_name: enclosing_function(&spans, line_no).to_string(),
                     description: format!(
                         "String literal `{key}` looks like a hardcoded Stellar public key. \
                          Pass addresses in as contract parameters or configuration instead of \
