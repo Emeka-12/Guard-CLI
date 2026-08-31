@@ -8,7 +8,7 @@
 //! (containing `.storage()`) exists alongside an `env.invoke_contract` / `env.try_call`,
 //! the method is flagged. This catches both inlined and variable-mediated patterns.
 
-use crate::util::contractimpl_functions_excluding_test;
+use crate::util::{contractimpl_functions_excluding_test, receiver_chain_contains_storage};
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -75,7 +75,7 @@ struct DelegateVisitor {
 
 impl<'ast> Visit<'ast> for DelegateVisitor {
     fn visit_expr_method_call(&mut self, i: &'ast ExprMethodCall) {
-        if expr_contains_storage_rec(&i.receiver) && i.method == "get" {
+        if receiver_chain_contains_storage(&i.receiver) && i.method == "get" {
             self.has_storage_read = true;
         }
         if is_invoke_or_try_call(i) && is_env_receiver(&i.receiver, &self.env_ident) {
@@ -123,19 +123,6 @@ fn env_param_name(sig: &Signature) -> Option<String> {
         };
         Some(pat_ident.ident.to_string())
     })
-}
-
-fn expr_contains_storage_rec(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(m) => {
-            if m.method == "storage" {
-                return true;
-            }
-            expr_contains_storage_rec(&m.receiver)
-        }
-        Expr::Field(f) => expr_contains_storage_rec(&f.base),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
