@@ -44,7 +44,7 @@ impl Visit<'_> for DivVisitor<'_> {
     fn visit_expr_binary(&mut self, i: &ExprBinary) {
         let flagged = match &i.op {
             BinOp::Div(_) => !(is_literal(&i.left) && is_literal(&i.right)),
-            BinOp::DivAssign(_) => true,
+            BinOp::DivAssign(_) => !is_literal(&i.right),
             _ => false,
         };
         if flagged {
@@ -106,6 +106,32 @@ impl C {
 
     #[test]
     fn flags_div_assign() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn f(_env: Env, mut x: i128, y: i128) { x /= y; }
+}
+"#);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn ignores_div_assign_of_literal() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn f(_env: Env, mut x: i128) { x /= 2; }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn flags_div_assign_of_non_literal() {
         let hits = run(r#"
 use soroban_sdk::{contractimpl, Env};
 pub struct C;
