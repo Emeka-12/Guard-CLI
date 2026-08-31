@@ -129,7 +129,9 @@ fn is_unchecked_binary(e: &ExprBinary) -> bool {
         BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) => {
             !(is_literal_expr(&e.left) && is_literal_expr(&e.right))
         }
-        BinOp::AddAssign(_) | BinOp::SubAssign(_) | BinOp::MulAssign(_) => true,
+        BinOp::AddAssign(_) | BinOp::SubAssign(_) | BinOp::MulAssign(_) => {
+            !is_literal_expr(&e.right)
+        }
         _ => false,
     }
 }
@@ -255,6 +257,50 @@ impl C {
 
     #[test]
     fn flags_add_assign() -> Result<(), syn::Error> {
+        let file = parse_file(
+            r#"
+use soroban_sdk::{contractimpl, Env};
+
+pub struct C;
+
+#[contractimpl]
+impl C {
+    pub fn acc(env: Env, mut x: i128, y: i128) {
+        let _ = env;
+        x += y;
+    }
+}
+"#,
+        )?;
+        let hits = UncheckedArithmeticCheck.run(&file, "");
+        assert_eq!(hits.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_add_assign_of_literal() -> Result<(), syn::Error> {
+        let file = parse_file(
+            r#"
+use soroban_sdk::{contractimpl, Env};
+
+pub struct C;
+
+#[contractimpl]
+impl C {
+    pub fn acc(env: Env, mut x: i128) {
+        let _ = env;
+        x += 1;
+    }
+}
+"#,
+        )?;
+        let hits = UncheckedArithmeticCheck.run(&file, "");
+        assert!(hits.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn flags_add_assign_of_non_literal() -> Result<(), syn::Error> {
         let file = parse_file(
             r#"
 use soroban_sdk::{contractimpl, Env};

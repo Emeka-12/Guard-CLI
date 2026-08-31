@@ -1,3 +1,5 @@
+use crate::util::receiver_chain_contains_events;
+use crate::util::receiver_chain_contains_storage;
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
 use syn::spanned::Spanned;
@@ -95,7 +97,11 @@ struct StorageWriteVisitor {
 
 impl<'ast> Visit<'ast> for StorageWriteVisitor {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if matches!(node.method.to_string().as_str(), "set" | "remove" | "append") {
+        if matches!(
+            node.method.to_string().as_str(),
+            "set" | "remove" | "append"
+        ) && receiver_chain_contains_storage(&node.receiver)
+        {
             self.found_write = true;
         }
         visit::visit_expr_method_call(self, node);
@@ -115,7 +121,7 @@ struct EventVisitor {
 
 impl<'ast> Visit<'ast> for EventVisitor {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if node.method == "publish" {
+        if node.method == "publish" && receiver_chain_contains_events(&node.receiver) {
             self.found_event = true;
         }
         visit::visit_expr_method_call(self, node);
@@ -141,6 +147,24 @@ impl C {
         let check = MissingEventForAdminChangeCheck;
         let findings = check.run(&file, src);
         assert_eq!(findings.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_local_collection_write_not_storage() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn set_operator(env: Env, op: Address) {
+        let mut log: Map<Address, u32> = Map::new(&env);
+        log.set(op.clone(), 1);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingEventForAdminChangeCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 0);
         Ok(())
     }
 }

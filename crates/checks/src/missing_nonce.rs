@@ -1,3 +1,4 @@
+use crate::util::receiver_chain_contains_storage;
 use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
 use syn::{FnArg, ImplItem, ItemImpl};
@@ -92,7 +93,8 @@ impl<'ast> Visit<'ast> for StorageWriteVisitor {
         if matches!(
             node.method.to_string().as_str(),
             "set" | "remove" | "append" | "push" | "push_back"
-        ) {
+        ) && receiver_chain_contains_storage(&node.receiver)
+        {
             self.found_write = true;
         }
         visit::visit_expr_method_call(self, node);
@@ -102,17 +104,29 @@ impl<'ast> Visit<'ast> for StorageWriteVisitor {
 fn contains_address_param(inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>) -> bool {
     inputs.iter().any(|arg| {
         if let FnArg::Typed(pat_type) = arg {
-            matches!(&*pat_type.ty, syn::Type::Path(type_path) if type_path.path.is_ident("Address"))
+            matches!(
+                &*pat_type.ty,
+                syn::Type::Path(type_path) if type_path.path.segments.last().is_some_and(|s| s.ident == "Address")
+            )
         } else {
             false
         }
     })
 }
 
+/// Requires the nonce keyword to be an actual value reference (a variable/const read, e.g.
+/// a storage key or an argument passed into a comparison or call) rather than any identifier
+/// occurring anywhere in the body — a `let` binding name or an unrelated method name (like
+/// `.sequence()`) no longer counts, since neither reads a nonce value.
 fn contains_nonce_reference(block: &syn::Block) -> bool {
     let mut visitor = NonceKeywordVisitor::default();
     visit::visit_block(&mut visitor, block);
     visitor.found
+}
+
+fn str_contains_nonce_keyword(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    NONCE_KEYWORDS.iter().any(|keyword| lower.contains(keyword))
 }
 
 #[derive(Default)]
@@ -121,11 +135,37 @@ struct NonceKeywordVisitor {
 }
 
 impl<'ast> Visit<'ast> for NonceKeywordVisitor {
-    fn visit_ident(&mut self, node: &'ast syn::Ident) {
-        if NONCE_KEYWORDS.iter().any(|keyword| node == keyword) {
-            self.found = true;
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if let Some(ident) = node.path.get_ident() {
+            if NONCE_KEYWORDS.iter().any(|keyword| ident == keyword) {
+                self.found = true;
+            }
         }
-        visit::visit_ident(self, node);
+        visit::visit_expr_path(self, node);
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        if m.path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "symbol_short")
+        {
+            if let Ok(syn::Lit::Str(s)) = syn::parse2::<syn::Lit>(m.tokens.clone()) {
+                if str_contains_nonce_keyword(&s.value()) {
+                    self.found = true;
+                }
+            }
+        }
+        visit::visit_macro(self, m);
+    }
+
+    fn visit_expr_lit(&mut self, node: &'ast syn::ExprLit) {
+        if let syn::Lit::Str(s) = &node.lit {
+            if str_contains_nonce_keyword(&s.value()) {
+                self.found = true;
+            }
+        }
+        visit::visit_expr_lit(self, node);
     }
 }
 
@@ -166,6 +206,59 @@ impl C {
         let check = MissingNonceCheck;
         let findings = check.run(&file, src);
         assert_eq!(findings.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_local_collection_write_not_storage() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn set_operator(env: Env, op: Address) {
+        let mut log: Vec<Address> = Vec::new(&env);
+        log.push_back(op.clone());
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingNonceCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn flags_unrelated_sequence_local_with_unprotected_write() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn update(env: Env, user: Address, v: u32) {
+        let sequence = env.ledger().sequence();
+        env.storage().instance().set(&V, &v);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingNonceCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn flags_fully_qualified_address_param() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn update(env: Env, user: soroban_sdk::Address, new_val: u32) {
+        env.storage().instance().set(&symbol_short!("val"), &new_val);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingNonceCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 1);
         Ok(())
     }
 }
