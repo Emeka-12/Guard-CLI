@@ -54,7 +54,13 @@ impl Check for ReInitializationRiskCheck {
 }
 
 fn is_init_fn(name: &str) -> bool {
-    name.contains("init") || name.contains("setup")
+    name == "init"
+        || name == "initialize"
+        || name == "setup"
+        || name == "constructor"
+        || name.starts_with("init_")
+        || name.starts_with("initialize_")
+        || name.starts_with("setup_")
 }
 
 #[derive(Default)]
@@ -245,6 +251,66 @@ impl C {
 
     #[test]
     fn flags_init_without_any_guard() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn initialize(env: Env, admin: Address) {
+        env.storage().instance().set(&0, &admin);
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn ignores_deinit() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn deinit(env: Env, admin: Address) {
+        env.storage().instance().set(&0, &admin);
+    }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn ignores_commit_setup() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn commit_setup(env: Env, admin: Address) {
+        env.storage().instance().set(&0, &admin);
+    }
+}
+"#);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn flags_init_still() {
+        let hits = run(r#"
+use soroban_sdk::{contractimpl, Env, Address};
+pub struct C;
+#[contractimpl]
+impl C {
+    pub fn init(env: Env, admin: Address) {
+        env.storage().instance().set(&0, &admin);
+    }
+}
+"#);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn flags_initialize_still() {
         let hits = run(r#"
 use soroban_sdk::{contractimpl, Env, Address};
 pub struct C;

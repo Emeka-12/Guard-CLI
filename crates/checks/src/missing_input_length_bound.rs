@@ -39,7 +39,7 @@ impl<'ast> Visit<'ast> for InputLengthVisitor {
                                     check_name: CHECK_NAME.to_string(),
                                     severity: Severity::Medium,
                                     file_path: String::new(),
-                                    line: method.span().start().line,
+                                    line: method.sig.fn_token.span().start().line,
                                     function_name: method.sig.ident.to_string(),
                                     description: format!(
                                         "Parameter `{}` (Bytes/Vec) lacks length validation",
@@ -166,6 +166,26 @@ impl C {
         let check = MissingInputLengthBoundCheck;
         let findings = check.run(&file, src);
         assert_eq!(findings.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_fn_line_not_doc_comment_line() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    /// Process some data.
+    #[some_attr]
+    pub fn process(env: Env, data: Bytes) {
+        let x = data;
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingInputLengthBoundCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 6);
         Ok(())
     }
 }

@@ -43,7 +43,7 @@ impl<'ast> Visit<'ast> for AdminEventVisitor {
                                 check_name: CHECK_NAME.to_string(),
                                 severity: Severity::Medium,
                                 file_path: String::new(),
-                                line: method.span().start().line,
+                                line: method.sig.fn_token.span().start().line,
                                 function_name: name.clone(),
                                 description: format!(
                                     "Admin change function `{}` lacks event emission",
@@ -164,6 +164,8 @@ impl C {
         let file = parse_file(src)?;
         let check = MissingEventForAdminChangeCheck;
         let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 6);
         assert_eq!(findings.len(), 0);
         Ok(())
     }

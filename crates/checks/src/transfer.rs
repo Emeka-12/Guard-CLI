@@ -26,7 +26,7 @@ impl Check for SelfTransferCheck {
         let mut out = Vec::new();
         for method in contractimpl_functions_excluding_test(file) {
             let fn_name = method.sig.ident.to_string();
-            if !fn_name.contains("transfer") {
+            if !is_transfer_like_name(&fn_name) {
                 continue;
             }
             if body_has_sender_recipient_guard(&method.block) {
@@ -56,6 +56,13 @@ impl Check for SelfTransferCheck {
         }
         out
     }
+}
+
+fn is_transfer_like_name(name: &str) -> bool {
+    name == "transfer"
+        || name.starts_with("transfer_")
+        || name.starts_with("safe_transfer")
+        || name.ends_with("_transfer")
 }
 
 /// Returns true if the method body contains a comparison (`!=` or `==`) between identifiers
@@ -450,6 +457,50 @@ impl C {
         )?;
         let hits = SelfTransferCheck.run(&file, "");
         assert_eq!(hits.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_transfer_ownership() -> Result<(), syn::Error> {
+        let file = parse_file(
+            r#"
+use soroban_sdk::{contractimpl, Address, Env};
+
+pub struct C;
+
+#[contractimpl]
+impl C {
+    pub fn transfer_ownership(env: Env, new_owner: Address) {
+        let _ = (env, new_owner);
+    }
+}
+"#,
+        )?;
+        let hits = SelfTransferCheck.run(&file, "");
+        assert!(hits.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn flags_transfer_without_guard_still() -> Result<(), syn::Error> {
+        let file = parse_file(
+            r#"
+use soroban_sdk::{contractimpl, Address, Env};
+
+pub struct C;
+
+#[contractimpl]
+impl C {
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let _ = (env, amount);
+    }
+}
+"#,
+        )?;
+        let hits = SelfTransferCheck.run(&file, "");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].function_name, "transfer");
         Ok(())
     }
 }

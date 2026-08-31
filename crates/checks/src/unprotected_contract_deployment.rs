@@ -1,8 +1,8 @@
-use crate::util::{self, env_param_name, receiver_chain_contains, receiver_chain_contains_storage};
+use crate::util::{self, contractimpl_functions_excluding_test};
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprMethodCall, ImplItem, ItemImpl, Pat};
+use syn::{Expr, ExprMethodCall, Pat};
 
 const CHECK_NAME: &str = "unprotected-contract-deployment";
 
@@ -14,75 +14,46 @@ impl Check for UnprotectedContractDeploymentCheck {
     }
 
     fn run(&self, file: &syn::File, _source: &str) -> Vec<Finding> {
-        let mut visitor = DeploymentVisitor::default();
-        visit::visit_file(&mut visitor, file);
-        visitor.findings
-    }
-}
+        let mut out = Vec::new();
+        for method in contractimpl_functions_excluding_test(file) {
+            if matches!(method.vis, syn::Visibility::Public(_)) {
+                let (has_deployer, line) = has_deployer_call(&method.block);
+                if has_deployer {
+                    let env_name =
+                        env_param_name(&method.sig).unwrap_or_else(|| "env".to_string());
+                    let address_names = util::address_param_names(&method.sig);
+                    let auth_line = first_valid_auth_line(method, &env_name, &address_names);
 
-#[derive(Default)]
-struct DeploymentVisitor {
-    findings: Vec<Finding>,
-}
+                    let unprotected = match auth_line {
+                        Some(auth) => auth >= line,
+                        None => true,
+                    };
 
-impl<'ast> Visit<'ast> for DeploymentVisitor {
-    fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
-        if has_contractimpl_attr(&node.attrs) {
-            for item in &node.items {
-                if let ImplItem::Fn(method) = item {
-                    if matches!(method.vis, syn::Visibility::Public(_)) {
-                        let (has_deployer, line) = has_deployer_call(&method.block);
-                        if has_deployer {
-                            let env_name =
-                                env_param_name(&method.sig).unwrap_or_else(|| "env".to_string());
-                            let address_names = util::address_param_names(&method.sig);
-                            let auth_line = first_valid_auth_line(method, &env_name, &address_names);
-
-                            let unprotected = match auth_line {
-                                Some(auth) => auth >= line,
-                                None => true,
-                            };
-
-                            if unprotected {
-                                self.findings.push(Finding {
-                                    check_name: CHECK_NAME.to_string(),
-                                    severity: Severity::High,
-                                    file_path: String::new(),
-                                    line,
-                                    function_name: method.sig.ident.to_string(),
-                                    description:
-                                        "Contract deployment call lacks valid require_auth protection"
-                                            .to_string(),
-                                    rule_url: Some(
-                                        "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unprotected-contract-deployment-high"
-                                            .to_string(),
-                                    ),
-                                    suggestion: Some(
-                                        "Add env.require_auth() before deployment operations"
-                                            .to_string(),
-                                    ),
-                                });
-                            }
-                        }
+                    if unprotected {
+                        out.push(Finding {
+                            check_name: CHECK_NAME.to_string(),
+                            severity: Severity::High,
+                            file_path: String::new(),
+                            line,
+                            function_name: method.sig.ident.to_string(),
+                            description:
+                                "Contract deployment call lacks valid require_auth protection"
+                                    .to_string(),
+                            rule_url: Some(
+                                "https://github.com/SorobanGuard/Guard-CLI/blob/main/docs/checks.md#unprotected-contract-deployment-high"
+                                    .to_string(),
+                            ),
+                            suggestion: Some(
+                                "Add env.require_auth() before deployment operations"
+                                    .to_string(),
+                            ),
+                        });
                     }
                 }
             }
         }
-        visit::visit_item_impl(self, node);
+        out
     }
-}
-
-fn has_contractimpl_attr(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        if let syn::Meta::Path(path) = &attr.meta {
-            path.segments
-                .last()
-                .map(|seg| seg.ident == "contractimpl")
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    })
 }
 
 fn has_deployer_call(block: &syn::Block) -> (bool, usize) {
@@ -289,6 +260,35 @@ impl C {
         let check = UnprotectedContractDeploymentCheck;
         let findings = check.run(&file, src);
         assert!(findings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_methods_inside_cfg_test() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn upload(env: Env, wasm: Bytes) {
+        env.deployer().upload_contract_wasm(&wasm);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use soroban_sdk::{contractimpl, Env, Bytes};
+
+    #[contractimpl]
+    impl C {
+        pub fn upload(env: Env, wasm: Bytes) {
+            env.deployer().upload_contract_wasm(&wasm);
+        }
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = UnprotectedContractDeploymentCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 1);
         Ok(())
     }
 }
