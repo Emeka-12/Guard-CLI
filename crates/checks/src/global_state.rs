@@ -1,7 +1,9 @@
 //! Detects `static mut` items in Soroban contracts (mutable global state).
 
+use crate::util::is_cfg_test;
 use crate::{Check, Finding, Severity};
-use syn::{File, ImplItem, Item, ItemStatic, Stmt};
+use syn::visit::{self, Visit};
+use syn::{File, ItemMod, ItemStatic};
 
 const CHECK_NAME: &str = "mutable-global-state";
 
@@ -13,10 +15,11 @@ impl Check for MutableGlobalStateCheck {
     }
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
-        let mut statics = Vec::new();
-        collect_static_items(&file.items, false, &mut statics);
+        let mut visitor = StaticVisitor { out: Vec::new() };
+        visitor.visit_file(file);
 
-        statics
+        visitor
+            .out
             .into_iter()
             .filter_map(|ItemStatic { mutability, ident, .. }| {
                 if matches!(mutability, syn::StaticMutability::Mut(_)) {
@@ -48,54 +51,28 @@ impl Check for MutableGlobalStateCheck {
     }
 }
 
-/// Returns `true` when `attrs` contains `#[cfg(test)]`.
-fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        if !attr.path().is_ident("cfg") {
-            return false;
-        }
-        attr.parse_args::<syn::Ident>()
-            .map(|id| id == "test")
-            .unwrap_or(false)
-    })
+/// Collects every `ItemStatic` reachable in the file via a full `syn::visit`
+/// walk, so it finds one nested arbitrarily deep — inside a block (even an
+/// `unsafe {}` one), a free function, a trait impl, or a `#[contractimpl]`
+/// method — rather than only the shapes a hand-rolled recursion anticipated.
+/// `#[cfg(test)]`-gated modules (in the [`is_cfg_test`] sense, so
+/// `#[cfg(all(test, ...))]` too) and modules named `tests`/`test` are pruned
+/// from the walk entirely, so nothing inside them is visited.
+struct StaticVisitor<'a> {
+    out: Vec<&'a ItemStatic>,
 }
 
-/// Every `static` item in the file, recursing into nested `mod` blocks and
-/// `impl` method bodies. Skips `#[cfg(test)]` modules and modules named
-/// `tests` or `test`.
-fn collect_static_items<'a>(items: &'a [Item], in_test_mod: bool, out: &mut Vec<&'a ItemStatic>) {
-    for item in items {
-        match item {
-            Item::Mod(m) => {
-                // Skip test modules entirely — mirrors util::collect_contractimpl_fns.
-                let is_test = in_test_mod
-                    || is_cfg_test(&m.attrs)
-                    || m.ident == "tests"
-                    || m.ident == "test";
-                if let Some((_, nested)) = &m.content {
-                    collect_static_items(nested, is_test, out);
-                }
-            }
-            Item::Static(item_static) if !in_test_mod => out.push(item_static),
-            Item::Impl(item_impl) if !in_test_mod => {
-                // Descend into impl method bodies to catch local `static mut` declarations.
-                for impl_item in &item_impl.items {
-                    if let ImplItem::Fn(method) = impl_item {
-                        collect_static_items_from_stmts(&method.block.stmts, out);
-                    }
-                }
-            }
-            _ => {}
-        }
+impl<'a> Visit<'a> for StaticVisitor<'a> {
+    fn visit_item_static(&mut self, i: &'a ItemStatic) {
+        self.out.push(i);
+        visit::visit_item_static(self, i);
     }
-}
 
-/// Walk a list of statements collecting any `static` items declared inline.
-fn collect_static_items_from_stmts<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a ItemStatic>) {
-    for stmt in stmts {
-        if let Stmt::Item(Item::Static(item_static)) = stmt {
-            out.push(item_static);
+    fn visit_item_mod(&mut self, i: &'a ItemMod) {
+        if is_cfg_test(&i.attrs) || i.ident == "tests" || i.ident == "test" {
+            return; // prune: don't recurse into test modules at all.
         }
+        visit::visit_item_mod(self, i);
     }
 }
 
@@ -161,5 +138,58 @@ mod tests {
         let file = parse_file(src).unwrap();
         let hits = MutableGlobalStateCheck.run(&file, "");
         assert!(hits.is_empty(), "should not flag static mut inside module named `tests`");
+    }
+
+    #[test]
+    fn flags_static_mut_nested_inside_an_unsafe_block() {
+        let src = r#"
+pub fn tick(_env: Env) {
+    unsafe {
+        static mut N: u32 = 0;
+        N += 1;
+    }
+}
+"#;
+        let file = parse_file(src).unwrap();
+        let hits = MutableGlobalStateCheck.run(&file, "");
+        assert_eq!(
+            hits.len(),
+            1,
+            "should flag static mut nested inside an unsafe block"
+        );
+        assert!(hits[0].description.contains('N'));
+    }
+
+    #[test]
+    fn flags_static_mut_inside_a_module_level_free_function() {
+        let src = r#"
+fn helper() {
+    static mut CACHE: u64 = 0;
+}
+"#;
+        let file = parse_file(src).unwrap();
+        let hits = MutableGlobalStateCheck.run(&file, "");
+        assert_eq!(
+            hits.len(),
+            1,
+            "should flag static mut inside a module-level free function"
+        );
+        assert!(hits[0].description.contains("CACHE"));
+    }
+
+    #[test]
+    fn ignores_static_mut_inside_cfg_all_test_not_wasm32_module() {
+        let src = r#"
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod native {
+    static mut COUNTER: u32 = 0;
+}
+"#;
+        let file = parse_file(src).unwrap();
+        let hits = MutableGlobalStateCheck.run(&file, "");
+        assert!(
+            hits.is_empty(),
+            "should not flag static mut inside a #[cfg(all(test, ...))] module"
+        );
     }
 }

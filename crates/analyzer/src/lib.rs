@@ -60,6 +60,10 @@ pub enum ScanError {
     },
     #[error("Invalid glob pattern `{pattern}`: {reason}")]
     InvalidGlobPattern { pattern: String, reason: String },
+    /// A WalkDir traversal error (e.g. permission-denied on a subdirectory).
+    /// The scan is incomplete and must not be treated as clean.
+    #[error("Directory traversal error at {path}: {reason}")]
+    Traversal { path: PathBuf, reason: String },
 }
 
 /// The panic payload recovered from a [`Check`] that aborted mid-scan, in
@@ -230,7 +234,11 @@ fn is_suppressed(finding: &Finding, suppressions: &Suppressions, fn_spans: &[FnS
     let impl_type = fn_spans
         .iter()
         .find(|s| {
-            s.function_name == finding.function_name
+            // When a check leaves function_name empty (e.g. unchecked-divisor,
+            // symbol-key-collision, mutable-global-state), fall back to line-range
+            // containment so a function-scoped suppression above the enclosing method
+            // still silences the finding.
+            (finding.function_name.is_empty() || s.function_name == finding.function_name)
                 && s.start_line <= finding.line
                 && finding.line <= s.end_line
         })
@@ -261,6 +269,22 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
     });
 }
 
+/// Drop the medium-severity `integer-division-truncation` finding when the same
+/// file/line/function already has a high-severity `unchecked-divisor` finding.
+/// Both checks fire on the exact same non-literal `a / b` expression, so reporting
+/// both is redundant signal for one underlying division.
+fn suppress_redundant_division_finding(findings: &mut Vec<Finding>) {
+    let divisor_hits: HashSet<(String, usize, String)> = findings
+        .iter()
+        .filter(|f| f.check_name == "unchecked-divisor")
+        .map(|f| (f.file_path.clone(), f.line, f.function_name.clone()))
+        .collect();
+    findings.retain(|f| {
+        f.check_name != "integer-division-truncation"
+            || !divisor_hits.contains(&(f.file_path.clone(), f.line, f.function_name.clone()))
+    });
+}
+
 /// Compile a list of glob source strings into `glob::Pattern`s, surfacing the first
 /// invalid pattern as `ScanError::InvalidGlobPattern`. Shared by the exclude and
 /// include filters so `--include`/`--exclude` stay behaviourally identical.
@@ -278,14 +302,6 @@ fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
         }
     }
     Ok(compiled)
-}
-
-/// True when any pattern matches the path, tested both against the root-relative
-/// `label` and the full `path` (a pattern like `vendor/**` should match either form).
-fn glob_matches(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
-    patterns
-        .iter()
-        .any(|p| p.matches_path(label) || p.matches_path(path))
 }
 
 /// Result of applying the shared source-file filter to one candidate path.
@@ -345,11 +361,30 @@ fn collect_rust_paths(
 
     let mut files_skipped = 0;
     let mut paths = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                // Surface traversal errors (permission-denied on a directory,
+                // vanished path, symlink loop, etc.) as a hard failure.  A
+                // deploy-gating tool must not present an incomplete scan as clean.
+                let path = e
+                    .path()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| root.to_path_buf());
+                return Err(ScanError::Traversal {
+                    path,
+                    reason: e.to_string(),
+                });
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
         let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
         if path
             .components()
             .any(|c| matches!(c.as_os_str().to_str(), Some("target" | ".git")))
@@ -357,31 +392,23 @@ fn collect_rust_paths(
             continue;
         }
         let label = path.strip_prefix(root).unwrap_or(path);
-        if glob_matches(&exclude_patterns, label, path) {
-            continue;
-        }
-        if !include_patterns.is_empty() && !glob_matches(&include_patterns, label, path) {
-            continue;
-        }
-        // An unreadable file must not abort the whole scan (a `0600` file in a shared
-        // checkout, a broken symlink, a race with WalkDir's listing). Warn naming the
-        // path and skip it, matching the warn-and-continue precedent for check panics.
-        match has_generated_file_header(path) {
-            Ok(true) => {
-                files_skipped += 1;
-                continue;
-            }
-            Ok(false) => {}
+        match classify_rust_path(path, label, &exclude_patterns, &include_patterns) {
+            Ok(PathVerdict::Scan) => paths.push(path.to_path_buf()),
+            Ok(PathVerdict::GeneratedSkip) => files_skipped += 1,
+            Ok(PathVerdict::Reject) => {}
+            // An unreadable file must not abort the whole scan (a `0600` file in a shared
+            // checkout, a broken symlink, a race with WalkDir's listing). Warn naming the
+            // path and skip it, matching the warn-and-continue precedent for check panics.
             Err(e) => {
-                let err = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    ScanError::PermissionDenied {
-                        path: path.to_path_buf(),
+                let err = match &e {
+                    ScanError::Io(io)
+                        if io.kind() == std::io::ErrorKind::PermissionDenied =>
+                    {
+                        ScanError::PermissionDenied {
+                            path: path.to_path_buf(),
+                        }
                     }
-                } else {
-                    ScanError::IoRead {
-                        path: path.to_path_buf(),
-                        source: e,
-                    }
+                    _ => e,
                 };
                 eprintln!("warning: {err}, skipping file");
                 continue;
@@ -452,6 +479,7 @@ fn run_checks_for_file(
     }
 
     findings.sort_by_key(|f| f.line);
+    suppress_redundant_division_finding(&mut findings);
     dedup_findings(&mut findings);
     Ok((findings, check_panics))
 }
@@ -855,6 +883,79 @@ mod tests {
         assert_eq!(names(&file_findings), names(&dir_findings));
     }
 
+    /// An unreadable **subdirectory** must cause the scan to fail with
+    /// `ScanError::Traversal` — not silently succeed with a clean result.
+    ///
+    /// This is the fix for #484: `filter_map(Result::ok)` used to drop the WalkDir
+    /// traversal error, leaving the subtree silently unscanned while the exit code
+    /// remained 0.
+    ///
+    /// Unix-only (relies on POSIX mode bits); skipped when running as root.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subdirectory_is_not_silently_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-unreadable-dir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("src/private")).unwrap();
+
+        // A readable file at the top level.
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+        // A file inside the unreadable subdirectory.
+        fs::write(root.join("src/private/secret.rs"), "pub fn secret() {}").unwrap();
+
+        // Remove read+execute permission from the subdirectory so WalkDir cannot
+        // list its contents.
+        fs::set_permissions(
+            root.join("src/private"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        // If the process can still read the dir (running as root), the scenario
+        // under test does not apply; skip gracefully.
+        if root.join("src/private").read_dir().is_ok() {
+            let _ = fs::set_permissions(
+                root.join("src/private"),
+                fs::Permissions::from_mode(0o755),
+            );
+            fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+
+        let result = scan_directory(&root, &[], &[]);
+
+        // Restore permissions before any assertion so the temp dir can be cleaned up.
+        let _ = fs::set_permissions(
+            root.join("src/private"),
+            fs::Permissions::from_mode(0o755),
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            result.is_err(),
+            "scan_directory must return Err when a subdirectory is unreadable, \
+             not silently succeed — got Ok"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ScanError::Traversal { .. }),
+            "expected ScanError::Traversal, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("traversal") || err.to_string().contains("private"),
+            "error message should mention the path or 'traversal', got: {err}"
+        );
+    }
+
     #[test]
     fn scan_directory_rejects_invalid_exclude_glob() {
         let root = std::env::temp_dir().join(format!(
@@ -1087,6 +1188,45 @@ impl C {
         assert!(s
             .line_checks
             .contains(&(5, "unchecked-arithmetic".to_string())));
+    }
+
+    /// Regression test for #501: a function-scoped suppression above a method
+    /// must silence that method's findings even when the check leaves function_name
+    /// empty (e.g. unchecked-divisor, mutable-global-state, symbol-key-collision).
+    #[test]
+    fn function_scoped_suppression_silences_empty_function_name_findings() {
+        let src = "\
+#[contract]
+pub struct C;
+#[contractimpl]
+impl C {
+    // soroban-guard: allow(unchecked-divisor)
+    pub fn divide(env: Env, a: u128, b: u128) -> u128 {
+        let _ = env;
+        a / b
+    }
+}
+";
+        let file = syn::parse_file(src).expect("fixture should parse");
+        let fn_spans = build_fn_spans(&file);
+        let suppressions = parse_suppressions(src, &fn_spans);
+
+        // Simulate an unchecked-divisor finding with an empty function_name,
+        // as some checks emit.
+        let finding = Finding {
+            check_name: "unchecked-divisor".to_string(),
+            severity: soroban_guard_checks::Severity::High,
+            file_path: String::new(),
+            line: 8,
+            function_name: String::new(),
+            description: "divisor not validated".to_string(),
+            rule_url: None,
+            suggestion: None,
+        };
+        assert!(
+            is_suppressed(&finding, &suppressions, &fn_spans),
+            "function-scoped suppression should silence finding with empty function_name"
+        );
     }
 }
 

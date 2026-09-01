@@ -1,7 +1,8 @@
+use crate::util::contractimpl_functions_excluding_test;
 use crate::{Check, Finding, Severity};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{BinOp, Expr, ExprBinary, File, ImplItem, ItemImpl};
+use syn::{BinOp, Expr, ExprBinary, File};
 
 const CHECK_NAME: &str = "unchecked-divisor";
 
@@ -13,36 +14,16 @@ impl Check for UncheckedDivisorCheck {
     }
 
     fn run(&self, file: &File, _source: &str) -> Vec<Finding> {
-        let mut visitor = DivisorVisitor::default();
-        visit::visit_file(&mut visitor, file);
-        visitor.findings
-    }
-}
-
-#[derive(Default)]
-struct DivisorVisitor {
-    findings: Vec<Finding>,
-    current_function_name: String,
-}
-
-impl<'ast> Visit<'ast> for DivisorVisitor {
-    fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
-        for item in &node.items {
-            if let ImplItem::Fn(method) = item {
-                let old_function_name = self.current_function_name.clone();
-                self.current_function_name = method.sig.ident.to_string();
-
-                let mut expr_visitor = DivisorExprVisitor {
-                    findings: Vec::new(),
-                    current_function_name: self.current_function_name.clone(),
-                };
-                visit::visit_block(&mut expr_visitor, &method.block);
-                self.findings.extend(expr_visitor.findings);
-
-                self.current_function_name = old_function_name;
-            }
+        let mut findings = Vec::new();
+        for method in contractimpl_functions_excluding_test(file) {
+            let mut expr_visitor = DivisorExprVisitor {
+                findings: Vec::new(),
+                current_function_name: method.sig.ident.to_string(),
+            };
+            visit::visit_block(&mut expr_visitor, &method.block);
+            findings.extend(expr_visitor.findings);
         }
-        visit::visit_item_impl(self, node);
+        findings
     }
 }
 
@@ -133,6 +114,50 @@ impl C {
 impl C {
     pub fn divide(a: u128) -> u128 {
         a / 2
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = UncheckedDivisorCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_non_contractimpl_impl() -> Result<(), syn::Error> {
+        let src = r#"
+impl C {
+    pub fn divide(a: u128, b: u128) -> u128 {
+        a / b
+    }
+}
+
+impl std::fmt::Display for C {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.a / self.b)
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = UncheckedDivisorCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_cfg_test_module() -> Result<(), syn::Error> {
+        let src = r#"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[contractimpl]
+    impl C {
+        pub fn divide(a: u128, b: u128) -> u128 {
+            a / b
+        }
     }
 }
         "#;

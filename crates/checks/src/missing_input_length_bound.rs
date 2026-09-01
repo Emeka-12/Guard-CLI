@@ -2,6 +2,7 @@ use crate::{Check, Finding, Severity};
 use syn::visit::{self, Visit};
 use syn::spanned::Spanned;
 use syn::{ImplItem, ItemImpl, FnArg, Pat};
+use quote::ToTokens;
 
 
 const CHECK_NAME: &str = "missing-input-length-bound";
@@ -38,7 +39,7 @@ impl<'ast> Visit<'ast> for InputLengthVisitor {
                                     check_name: CHECK_NAME.to_string(),
                                     severity: Severity::Medium,
                                     file_path: String::new(),
-                                    line: method.span().start().line,
+                                    line: method.sig.fn_token.span().start().line,
                                     function_name: method.sig.ident.to_string(),
                                     description: format!(
                                         "Parameter `{}` (Bytes/Vec) lacks length validation",
@@ -82,10 +83,9 @@ fn find_bytes_vec_params(
     let mut params = Vec::new();
     for arg in inputs {
         if let FnArg::Typed(pat_type) = arg {
-            let ty_str = format!("{:?}", pat_type.ty);
-            if ty_str.contains("Bytes") || ty_str.contains("Vec") {
+            if let Some(ty_name) = unbounded_collection_type_name(&pat_type.ty) {
                 if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                    params.push((pat_ident.ident.to_string(), ty_str));
+                    params.push((pat_ident.ident.to_string(), ty_name.to_string()));
                 }
             }
         }
@@ -93,8 +93,38 @@ fn find_bytes_vec_params(
     params
 }
 
+/// Peels `&`/`&mut` references and parens off a type so `&Bytes` matches like `Bytes`.
+fn unwrap_type(ty: &syn::Type) -> &syn::Type {
+    match ty {
+        syn::Type::Reference(r) => unwrap_type(&r.elem),
+        syn::Type::Paren(p) => unwrap_type(&p.elem),
+        syn::Type::Group(g) => unwrap_type(&g.elem),
+        _ => ty,
+    }
+}
+
+/// Returns `"Bytes"`/`"Vec"` when `ty`'s last path segment is one of those unbounded,
+/// runtime-length collection types. Fixed-length types such as `BytesN<32>` are
+/// intentionally excluded: their length is a compile-time constant, so there is nothing
+/// for a length check to validate.
+fn unbounded_collection_type_name(ty: &syn::Type) -> Option<&'static str> {
+    let syn::Type::Path(type_path) = unwrap_type(ty) else {
+        return None;
+    };
+    match type_path.path.segments.last()?.ident.to_string().as_str() {
+        "Bytes" => Some("Bytes"),
+        "Vec" => Some("Vec"),
+        _ => None,
+    }
+}
+
 fn has_length_check(block: &syn::Block, param_name: &str) -> bool {
-    let block_text = format!("{:?}", block);
+    let block_text: String = block
+        .to_token_stream()
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let len_check = format!("{}.len()", param_name);
     let is_empty = format!("{}.is_empty()", param_name);
     block_text.contains(&len_check) || block_text.contains(&is_empty)
@@ -119,6 +149,43 @@ impl C {
         let check = MissingInputLengthBoundCheck;
         let findings = check.run(&file, src);
         assert_eq!(findings.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_fixed_size_bytes_n() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn process(env: Env, data: BytesN<32>) {
+        let x = data;
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingInputLengthBoundCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_fn_line_not_doc_comment_line() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    /// Process some data.
+    #[some_attr]
+    pub fn process(env: Env, data: Bytes) {
+        let x = data;
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let check = MissingInputLengthBoundCheck;
+        let findings = check.run(&file, src);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 6);
         Ok(())
     }
 }
